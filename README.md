@@ -35,7 +35,7 @@ Git
 
 Installation
 bash# Clone the repository
-git clone https://github.com/yourusername/noshitalk.git
+git clone https://github.com/gabrix73/noshitalk.git
 cd noshitalk
 
 # Install dependencies
