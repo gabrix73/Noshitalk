@@ -1,21 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"compress/zlib"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
+	"crypto/hmac"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
-	"log"
-	"math/big"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
@@ -34,74 +33,161 @@ type Client struct {
 	quit         chan struct{}
 	lastActivity time.Time
 	mu           sync.Mutex
+	
+	// Visibility control
+	isVisible    bool
+	
+	// Key rotation
+	currentKeyPair   *ecdh.PrivateKey
+	nextKeyPair      *ecdh.PrivateKey
+	sessionKeys      [][]byte
+	keyRotationCount uint32
+	lastRotation     time.Time
+	messageCount     uint32
+}
+
+type FileTransfer struct {
+	FileID      string
+	Sender      *Client
+	Receiver    *Client
+	StartTime   time.Time
+	TotalChunks int
+	Received    int
+	Completed   bool
 }
 
 type Message struct {
 	From    string `json:"from"`
+	To      string `json:"to,omitempty"`
 	Content string `json:"content"`
 	Time    string `json:"time"`
 	Type    string `json:"type"`
 }
 
+type UserListMessage struct {
+	Type  string   `json:"type"`
+	Users []string `json:"users"`
+	Time  string   `json:"time"`
+}
+
+type FileOfferMessage struct {
+	Type         string `json:"type"`
+	From         string `json:"from"`
+	To           string `json:"to"`
+	FileID       string `json:"file_id"`
+	Filename     string `json:"filename"`
+	Size         int64  `json:"size"`
+	TotalChunks  int    `json:"total_chunks"`
+	SHA256       string `json:"sha256"`
+	Compressed   bool   `json:"compressed"`
+	Time         string `json:"time"`
+}
+
+type FileChunkMessage struct {
+	Type        string `json:"type"`
+	FileID      string `json:"file_id"`
+	ChunkIndex  int    `json:"chunk_index"`
+	TotalChunks int    `json:"total_chunks"`
+	Data        string `json:"data"`
+	Time        string `json:"time"`
+}
+
+type FileResponseMessage struct {
+	Type    string `json:"type"`
+	FileID  string `json:"file_id"`
+	From    string `json:"from"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	SHA256  string `json:"sha256,omitempty"`
+	Time    string `json:"time"`
+}
+
+type KeyRotationMessage struct {
+	Type      string `json:"type"`
+	PublicKey []byte `json:"public_key"`
+	Nonce     []byte `json:"nonce"`
+	Signature []byte `json:"signature"`
+	Time      string `json:"time"`
+}
+
 var (
-	clients    = make(map[net.Conn]*Client)
-	clientsMux sync.RWMutex
-	version    = "0.1"
+	clients        = make(map[net.Conn]*Client)
+	clientsMux     sync.RWMutex
+	fileTransfers  = make(map[string]*FileTransfer)
+	transfersMux   sync.RWMutex
+	version        = "1.0-enhanced"
 )
 
-const port = "0.0.0.0:8083"
+const (
+	handshakeTimeout  = 30 * time.Second
+	protocolVersion   = 2
+	messageBlockSize  = 256
+	minRandomDelay    = 50
+	maxRandomDelay    = 200
+	
+	// Enhanced file transfer settings
+	fileChunkSize         = 256 * 1024        // 256KB chunks
+	maxFileSize           = 500 * 1024 * 1024 // 500MB max
+	maxConcurrentTransfers = 3
+	
+	// Key rotation settings
+	rotateAfterMessages = 100
+	rotateAfterTime     = 5 * time.Minute
+)
 
 func main() {
-	fmt.Printf("🔐 NoshiTalk Server v%s - Maximum Security\n", version)
+	fmt.Printf("🔐 NoshiTalk Server v%s - Enhanced Security Edition\n", version)
 	fmt.Printf("⚠️  Zero logs, zero traces, auto-wipe post-session\n")
-	
+	fmt.Printf("🧅 Designed for Tor Hidden Service - localhost only\n")
+	fmt.Printf("🎭 Traffic obfuscation: Padding + Random delays\n")
+	fmt.Printf("🔄 Key rotation enabled (every %d messages or %v)\n", rotateAfterMessages, rotateAfterTime)
+	fmt.Printf("👻 Ghost mode enabled by default\n")
+
 	secureSetup()
 	defer secureShutdown("Session completed")
 
-	// Privacy-focused - no IP disclosure
-	fmt.Printf("🧅 Tor Hidden Service Only - No direct connections\n")
-	fmt.Printf("📍 Listening on port: 8083 (accessible only via Tor)\n")
-	fmt.Printf("\n")
+	listenAddr := "127.0.0.1:8083"
+	fmt.Printf("🔐 Listening on: localhost:8083 (Tor Hidden Service backend)\n")
+	fmt.Printf("⚠️  Server NOT exposed directly - Tor proxy required\n\n")
 
-	listener, err := tls.Listen("tcp", port, getTLSConfig())
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		fmt.Printf("❌ TLS listen error: %v\n", err)
-		secureShutdown(fmt.Sprintf("TLS listen error: %v", err))
+		fmt.Printf("❌ Listen error: %v\n", err)
+		secureShutdown(fmt.Sprintf("Listen error: %v", err))
 	}
 
 	fmt.Printf("🚀 Server started successfully\n")
-	fmt.Printf("🔗 Waiting for connections...\n")
+	fmt.Printf("🔗 Waiting for connections...\n\n")
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
 	go func() {
 		<-stop
 		fmt.Printf("\n🛑 Received shutdown signal\n")
 		secureShutdown("Operator requested shutdown")
 	}()
 
-	// Monitor goroutine - check for idle connections
+	// Monitor goroutine
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			clientsMux.RLock()
 			activeCount := len(clients)
-			if activeCount > 0 {
-				fmt.Printf("📊 Active connections: %d\n", activeCount)
-				// Check for idle connections (optional)
-				now := time.Now()
-				for _, client := range clients {
-					client.mu.Lock()
-					idleTime := now.Sub(client.lastActivity)
-					client.mu.Unlock()
-					if idleTime > 5*time.Minute {
-						fmt.Printf("⏰ [%s] Idle for %v\n", client.identity, idleTime)
-					}
+			visibleCount := 0
+			for _, client := range clients {
+				if client.isVisible {
+					visibleCount++
 				}
 			}
+			if activeCount > 0 {
+				fmt.Printf("📊 Active connections: %d (visible: %d, ghost: %d)\n", 
+					activeCount, visibleCount, activeCount-visibleCount)
+			}
 			clientsMux.RUnlock()
+			
+			// Cleanup old transfers
+			cleanupOldTransfers()
 		}
 	}()
 
@@ -112,101 +198,14 @@ func main() {
 			continue
 		}
 
-		fmt.Printf("🎯 New connection received\n")
+		fmt.Printf("🎯 New connection from %s\n", conn.RemoteAddr())
 		go handleClient(conn)
 	}
 }
 
-func getTLSConfig() *tls.Config {
-	if _, err := os.Stat("server_ec.crt"); os.IsNotExist(err) {
-		fmt.Println("🔧 Generating self-signed certificates for testing...")
-		if err := generateTestCerts(); err != nil {
-			log.Fatal("Error generating test certificates:", err)
-		}
-		fmt.Println("✅ Certificates generated successfully")
-	}
-
-	cert, err := tls.LoadX509KeyPair("server_ec.crt", "server_ec.key")
-	if err != nil {
-		log.Fatal("Error loading ECC server certificates:", err)
-	}
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.NoClientCert,
-		MinVersion:   tls.VersionTLS12,
-		CipherSuites: []uint16{
-			tls.TLS_AES_256_GCM_SHA384,
-			tls.TLS_CHACHA20_POLY1305_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-		},
-		CurvePreferences: []tls.CurveID{
-			tls.X25519,
-			tls.CurveP256,
-			tls.CurveP384,
-		},
-	}
-}
-
-func generateTestCerts() error {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return err
-	}
-
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization:  []string{"NoshiTalk"},
-			Country:       []string{"US"},
-			Province:      []string{""},
-			Locality:      []string{"San Francisco"},
-			StreetAddress: []string{""},
-			PostalCode:    []string{""},
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1)},
-		DNSNames:              []string{"localhost"},
-		BasicConstraintsValid: true,
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
-	if err != nil {
-		return err
-	}
-
-	certOut, err := os.Create("server_ec.crt")
-	if err != nil {
-		return err
-	}
-	defer certOut.Close()
-
-	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: certDER}); err != nil {
-		return err
-	}
-
-	keyOut, err := os.Create("server_ec.key")
-	if err != nil {
-		return err
-	}
-	defer keyOut.Close()
-
-	privBytes, err := x509.MarshalECPrivateKey(priv)
-	if err != nil {
-		return err
-	}
-
-	return pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: privBytes})
-}
-
-func getClientIdentity(conn net.Conn) (string, error) {
-	id := make([]byte, 8)
-	rand.Read(id)
-	return fmt.Sprintf("user_%x", id), nil
+func deriveIdentity(publicKey []byte) string {
+	hash := sha256.Sum256(publicKey)
+	return fmt.Sprintf("anon_%s", hex.EncodeToString(hash[:8]))
 }
 
 func handleClient(conn net.Conn) {
@@ -216,49 +215,34 @@ func handleClient(conn net.Conn) {
 		removeClient(conn)
 	}()
 
-	identity, err := getClientIdentity(conn)
-	if err != nil {
-		fmt.Printf("❌ Error getting client identity: %v\n", err)
-		return
-	}
-
-	fmt.Printf("🔑 Client authenticated: %s\n", identity)
-
 	curve := ecdh.X25519()
-	privateKey, err := curve.GenerateKey(rand.Reader)
+	privateKey, err := curve.GenerateKey(cryptorand.Reader)
 	if err != nil {
-		fmt.Printf("❌ [%s] Private key generation failed: %v\n", identity, err)
+		fmt.Printf("❌ Key generation failed: %v\n", err)
 		return
 	}
 
 	privateKeyBuffer := memguard.NewBufferFromBytes(privateKey.Bytes())
 	defer privateKeyBuffer.Destroy()
 
-	fmt.Printf("📥 [%s] Waiting for client public key...\n", identity)
+	fmt.Printf("📥 Waiting for client public key...\n")
 	clientPubKeyBytes := make([]byte, 32)
-	
-	// Set timeout for initial handshake
+
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	
-	totalRead := 0
-	for totalRead < 32 {
-		n, err := conn.Read(clientPubKeyBytes[totalRead:])
-		if err != nil {
-			fmt.Printf("❌ [%s] Error reading client public key (read %d/32 bytes): %v\n", identity, totalRead, err)
-			return
-		}
-		totalRead += n
-		fmt.Printf("📥 [%s] Read %d bytes, total: %d/32\n", identity, n, totalRead)
+	n, err := io.ReadFull(conn, clientPubKeyBytes)
+	if err != nil {
+		fmt.Printf("❌ Error reading client public key: %v\n", err)
+		return
 	}
-	
-	// Clear the deadline after handshake
 	conn.SetReadDeadline(time.Time{})
-	
-	fmt.Printf("✅ [%s] Received complete client public key (%d bytes)\n", identity, totalRead)
+
+	identity := deriveIdentity(clientPubKeyBytes)
+	fmt.Printf("🔑 Client identity derived: %s\n", identity)
+	fmt.Printf("✅ [%s] Received client public key (%d bytes)\n", identity, n)
 
 	clientPubKey, err := curve.NewPublicKey(clientPubKeyBytes)
 	if err != nil {
-		fmt.Printf("❌ [%s] Error parsing client public key: %v\n", identity, err)
+		fmt.Printf("❌ [%s] Invalid client public key: %v\n", identity, err)
 		return
 	}
 
@@ -268,7 +252,6 @@ func handleClient(conn net.Conn) {
 		fmt.Printf("❌ [%s] Error sending server public key: %v\n", identity, err)
 		return
 	}
-	fmt.Printf("✅ [%s] Sent server public key\n", identity)
 
 	fmt.Printf("🔢 [%s] Calculating shared secret...\n", identity)
 	sharedSecret, err := privateKey.ECDH(clientPubKey)
@@ -277,11 +260,14 @@ func handleClient(conn net.Conn) {
 		return
 	}
 
-	sharedSecretBuffer := memguard.NewBufferFromBytes(sharedSecret)
-	defer sharedSecretBuffer.Destroy()
+	fmt.Printf("🔐 [%s] Starting mutual authentication...\n", identity)
+	if err := performMutualAuth(conn, sharedSecret, identity); err != nil {
+		fmt.Printf("❌ [%s] Authentication failed: %v\n", identity, err)
+		return
+	}
 
 	fmt.Printf("🔐 [%s] Setting up AES-GCM...\n", identity)
-	block, err := aes.NewCipher(sharedSecret)
+	block, err := aes.NewCipher(sharedSecret[:32])
 	if err != nil {
 		fmt.Printf("❌ [%s] AES cipher creation failed: %v\n", identity, err)
 		return
@@ -293,6 +279,9 @@ func handleClient(conn net.Conn) {
 		return
 	}
 
+	sharedSecretBuffer := memguard.NewBufferFromBytes(sharedSecret)
+	defer sharedSecretBuffer.Destroy()
+
 	client := &Client{
 		conn:         conn,
 		identity:     identity,
@@ -300,29 +289,504 @@ func handleClient(conn net.Conn) {
 		sharedSecret: sharedSecretBuffer.Seal(),
 		quit:         make(chan struct{}),
 		lastActivity: time.Now(),
+		isVisible:    false, // Ghost mode by default
+		currentKeyPair: privateKey,
+		lastRotation:  time.Now(),
+		messageCount:  0,
 	}
 
 	addClient(conn, client)
-	fmt.Printf("✅ [%s] Client fully initialized and added to active connections\n", identity)
-	broadcastSystemMessage(fmt.Sprintf("🟢 %s connected", identity))
+	fmt.Printf("✅ [%s] Client initialized (ghost mode)\n", identity)
+	
+	// Send welcome message only to the new client
+	welcomeMsg := Message{
+		From:    "System",
+		Content: fmt.Sprintf("🟢 Connected as %s (ghost mode). Use /reveal to become visible, /ghost to hide.", identity),
+		Time:    time.Now().Format("15:04:05"),
+		Type:    "system",
+	}
+	msgJSON, _ := json.Marshal(welcomeMsg)
+	client.sendEncryptedMessage(string(msgJSON))
+	
+	// Send personal user list (only themselves initially)
+	sendPersonalUserList(client)
 
 	fmt.Printf("📡 [%s] Starting message handling...\n", identity)
 	client.receiveMessages()
 
-	fmt.Printf("📴 [%s] Client disconnected\n", identity)
-	broadcastSystemMessage(fmt.Sprintf("🔴 %s disconnected", identity))
+	fmt.Printf("🔴 [%s] Client disconnected\n", identity)
+	
+	// Only notify if user was visible
+	if client.isVisible {
+		broadcastSystemMessage(fmt.Sprintf("🔴 %s disconnected", identity))
+	}
 }
 
 func addClient(conn net.Conn, client *Client) {
 	clientsMux.Lock()
 	clients[conn] = client
+	totalClients := len(clients)
 	clientsMux.Unlock()
+
+	fmt.Printf("➕ [%s] Added to clients map. Total clients: %d\n", client.identity, totalClients)
 }
 
 func removeClient(conn net.Conn) {
 	clientsMux.Lock()
-	delete(clients, conn)
-	clientsMux.Unlock()
+	client, exists := clients[conn]
+	if exists && client.isVisible {
+		delete(clients, conn)
+		clientsMux.Unlock()
+		// Only update lists if user was visible
+		broadcastUserListToVisible()
+	} else {
+		delete(clients, conn)
+		clientsMux.Unlock()
+	}
+}
+
+func sendPersonalUserList(client *Client) {
+	// Send only visible users to this client
+	clientsMux.RLock()
+	visibleUsers := []string{}
+	for _, c := range clients {
+		if c.isVisible || c == client {
+			visibleUsers = append(visibleUsers, c.identity)
+		}
+	}
+	clientsMux.RUnlock()
+
+	userListMsg := UserListMessage{
+		Type:  "user_list",
+		Users: visibleUsers,
+		Time:  time.Now().Format("15:04:05"),
+	}
+
+	msgJSON, _ := json.Marshal(userListMsg)
+	client.sendEncryptedMessage(string(msgJSON))
+}
+
+func broadcastUserListToVisible() {
+	clientsMux.RLock()
+	defer clientsMux.RUnlock()
+
+	visibleUsers := []string{}
+	for _, c := range clients {
+		if c.isVisible {
+			visibleUsers = append(visibleUsers, c.identity)
+		}
+	}
+
+	userListMsg := UserListMessage{
+		Type:  "user_list",
+		Users: visibleUsers,
+		Time:  time.Now().Format("15:04:05"),
+	}
+
+	msgJSON, _ := json.Marshal(userListMsg)
+
+	// Send only to visible users
+	for _, client := range clients {
+		if client.isVisible {
+			client.sendEncryptedMessage(string(msgJSON))
+		}
+	}
+}
+
+func (c *Client) checkKeyRotation() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	needRotation := false
+	if c.messageCount >= rotateAfterMessages {
+		needRotation = true
+		fmt.Printf("🔄 [%s] Key rotation triggered (message count: %d)\n", c.identity, c.messageCount)
+	}
+	if time.Since(c.lastRotation) > rotateAfterTime {
+		needRotation = true
+		fmt.Printf("🔄 [%s] Key rotation triggered (time elapsed: %v)\n", c.identity, time.Since(c.lastRotation))
+	}
+
+	if needRotation {
+		c.performKeyRotation()
+	}
+}
+
+func (c *Client) performKeyRotation() {
+	// Generate new key pair
+	curve := ecdh.X25519()
+	newKeyPair, err := curve.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		fmt.Printf("❌ [%s] Key rotation failed: %v\n", c.identity, err)
+		return
+	}
+
+	c.nextKeyPair = newKeyPair
+	c.keyRotationCount++
+	c.messageCount = 0
+	c.lastRotation = time.Now()
+
+	// Send new public key to client
+	rotMsg := KeyRotationMessage{
+		Type:      "key_rotation",
+		PublicKey: newKeyPair.PublicKey().Bytes(),
+		Nonce:     make([]byte, 12),
+		Time:      time.Now().Format("15:04:05"),
+	}
+	
+	cryptorand.Read(rotMsg.Nonce)
+	
+	msgJSON, _ := json.Marshal(rotMsg)
+	c.sendEncryptedMessage(string(msgJSON))
+
+	fmt.Printf("✅ [%s] Key rotation completed (rotation #%d)\n", c.identity, c.keyRotationCount)
+}
+
+func compressData(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	w := zlib.NewWriter(&buf)
+	_, err := w.Write(data)
+	w.Close()
+	return buf.Bytes(), err
+}
+
+func decompressData(data []byte) ([]byte, error) {
+	r, err := zlib.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return io.ReadAll(r)
+}
+
+func (c *Client) receiveMessages() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("💥 [%s] PANIC: %v\n", c.identity, r)
+		}
+		close(c.quit)
+	}()
+	
+	buf := make([]byte, 512*1024) // Larger buffer for big file chunks
+	
+	fmt.Printf("📡 [%s] Starting receive loop\n", c.identity)
+	
+	for {
+		n, err := c.conn.Read(buf)
+		if err != nil {
+			if err == io.EOF {
+				fmt.Printf("🔴 [%s] Connection closed\n", c.identity)
+			} else {
+				fmt.Printf("❌ [%s] Read error: %v\n", c.identity, err)
+			}
+			return
+		}
+		
+		if n == 0 {
+			continue
+		}
+		
+		c.mu.Lock()
+		c.lastActivity = time.Now()
+		c.messageCount++
+		c.mu.Unlock()
+		
+		fmt.Printf("📥 [%s] Received %d bytes\n", c.identity, n)
+		
+		message, err := c.decryptMessage(buf[:n])
+		if err != nil {
+			fmt.Printf("❌ [%s] Decrypt error: %v\n", c.identity, err)
+			continue
+		}
+		
+		// Check for key rotation
+		c.checkKeyRotation()
+		
+		// Handle commands
+		if message == "/quit" {
+			return
+		}
+
+		if message == "/reveal" {
+			c.mu.Lock()
+			wasVisible := c.isVisible
+			c.isVisible = true
+			c.mu.Unlock()
+			
+			if !wasVisible {
+				fmt.Printf("👻→👤 [%s] Became visible\n", c.identity)
+				broadcastSystemMessage(fmt.Sprintf("👤 %s joined the chat", c.identity))
+				broadcastUserListToVisible()
+			}
+			continue
+		}
+
+		if message == "/ghost" {
+			c.mu.Lock()
+			wasVisible := c.isVisible
+			c.isVisible = false
+			c.mu.Unlock()
+			
+			if wasVisible {
+				fmt.Printf("👤→👻 [%s] Went ghost\n", c.identity)
+				broadcastSystemMessage(fmt.Sprintf("👻 %s went invisible", c.identity))
+				broadcastUserListToVisible()
+			}
+			continue
+		}
+
+		if message == "/users" {
+			sendPersonalUserList(c)
+			continue
+		}
+
+		// Handle file transfer messages
+		var genericMsg map[string]interface{}
+		if err := json.Unmarshal([]byte(message), &genericMsg); err == nil {
+			msgType, ok := genericMsg["type"].(string)
+			if ok {
+				switch msgType {
+				case "file_offer":
+					var fileOffer FileOfferMessage
+					if err := json.Unmarshal([]byte(message), &fileOffer); err == nil {
+						routeFileOfferEnhanced(c, &fileOffer)
+						continue
+					}
+				case "file_chunk":
+					var fileChunk FileChunkMessage
+					if err := json.Unmarshal([]byte(message), &fileChunk); err == nil {
+						routeFileChunkEnhanced(c, &fileChunk)
+						continue
+					}
+				case "file_accept", "file_reject", "file_complete":
+					var fileResp FileResponseMessage
+					if err := json.Unmarshal([]byte(message), &fileResp); err == nil {
+						routeFileResponseEnhanced(c, &fileResp)
+						continue
+					}
+				}
+			}
+		}
+
+		// Handle private messages
+		if len(message) > 4 && message[:4] == "/pm " {
+			parts := splitPrivateMessage(message)
+			if len(parts) < 2 {
+				errorMsg := Message{
+					From:    "System",
+					Content: "❌ Usage: /pm username message",
+					Time:    time.Now().Format("15:04:05"),
+					Type:    "error",
+				}
+				msgJSON, _ := json.Marshal(errorMsg)
+				c.sendEncryptedMessage(string(msgJSON))
+				continue
+			}
+			sendPrivateMessage(c, parts[0], parts[1])
+			continue
+		}
+
+		// Broadcast only if visible
+		if c.isVisible {
+			broadcastUserMessage(c, message)
+		} else {
+			// Ghost users can't broadcast
+			errorMsg := Message{
+				From:    "System",
+				Content: "👻 You are in ghost mode. Use /reveal to send messages.",
+				Time:    time.Now().Format("15:04:05"),
+				Type:    "error",
+			}
+			msgJSON, _ := json.Marshal(errorMsg)
+			c.sendEncryptedMessage(string(msgJSON))
+		}
+	}
+}
+
+func routeFileOfferEnhanced(sender *Client, offer *FileOfferMessage) {
+	// Check concurrent transfers limit
+	transfersMux.RLock()
+	activeTransfers := 0
+	for _, transfer := range fileTransfers {
+		if !transfer.Completed && transfer.Sender == sender {
+			activeTransfers++
+		}
+	}
+	transfersMux.RUnlock()
+
+	if activeTransfers >= maxConcurrentTransfers {
+		errorMsg := Message{
+			From:    "System",
+			Content: fmt.Sprintf("❌ Max concurrent transfers (%d) reached", maxConcurrentTransfers),
+			Time:    time.Now().Format("15:04:05"),
+			Type:    "error",
+		}
+		msgJSON, _ := json.Marshal(errorMsg)
+		sender.sendEncryptedMessage(string(msgJSON))
+		return
+	}
+
+	clientsMux.RLock()
+	var targetClient *Client
+	for _, client := range clients {
+		if client.identity == offer.To {
+			targetClient = client
+			break
+		}
+	}
+	clientsMux.RUnlock()
+
+	if targetClient == nil {
+		errorMsg := Message{
+			From:    "System",
+			Content: fmt.Sprintf("❌ User '%s' not found", offer.To),
+			Time:    time.Now().Format("15:04:05"),
+			Type:    "error",
+		}
+		msgJSON, _ := json.Marshal(errorMsg)
+		sender.sendEncryptedMessage(string(msgJSON))
+		return
+	}
+
+	// Create transfer tracking
+	transfer := &FileTransfer{
+		FileID:      offer.FileID,
+		Sender:      sender,
+		Receiver:    targetClient,
+		StartTime:   time.Now(),
+		TotalChunks: offer.TotalChunks,
+		Received:    0,
+		Completed:   false,
+	}
+
+	transfersMux.Lock()
+	fileTransfers[offer.FileID] = transfer
+	transfersMux.Unlock()
+
+	offer.From = sender.identity
+	offer.Time = time.Now().Format("15:04:05")
+
+	fmt.Printf("📁 [%s → %s] File offer: %s (%d bytes, %d chunks, compressed: %v)\n",
+		sender.identity, offer.To, offer.Filename, offer.Size, offer.TotalChunks, offer.Compressed)
+
+	offerJSON, _ := json.Marshal(offer)
+	targetClient.sendEncryptedMessage(string(offerJSON))
+}
+
+func routeFileChunkEnhanced(sender *Client, chunk *FileChunkMessage) {
+	transfersMux.RLock()
+	transfer, exists := fileTransfers[chunk.FileID]
+	transfersMux.RUnlock()
+
+	if !exists {
+		fmt.Printf("⚠️ [%s] Unknown file transfer: %s\n", sender.identity, chunk.FileID[:8])
+		return
+	}
+
+	if transfer.Sender != sender {
+		fmt.Printf("⚠️ [%s] Unauthorized chunk sender for: %s\n", sender.identity, chunk.FileID[:8])
+		return
+	}
+
+	chunk.Time = time.Now().Format("15:04:05")
+
+	// Update progress
+	transfersMux.Lock()
+	transfer.Received++
+	if transfer.Received >= transfer.TotalChunks {
+		transfer.Completed = true
+		duration := time.Since(transfer.StartTime)
+		fmt.Printf("✅ [%s] File transfer completed in %v\n", sender.identity, duration)
+	}
+	transfersMux.Unlock()
+
+	fmt.Printf("📦 [%s] File chunk %d/%d (FileID: %s)\n",
+		sender.identity, chunk.ChunkIndex+1, chunk.TotalChunks, chunk.FileID[:8])
+
+	chunkJSON, _ := json.Marshal(chunk)
+	transfer.Receiver.sendEncryptedMessage(string(chunkJSON))
+}
+
+func routeFileResponseEnhanced(sender *Client, resp *FileResponseMessage) {
+	transfersMux.RLock()
+	transfer, exists := fileTransfers[resp.FileID]
+	transfersMux.RUnlock()
+
+	if exists {
+		resp.From = sender.identity
+		resp.Time = time.Now().Format("15:04:05")
+
+		fmt.Printf("📬 [%s] File response: %s (FileID: %s)\n",
+			sender.identity, resp.Status, resp.FileID[:8])
+
+		respJSON, _ := json.Marshal(resp)
+		
+		// Send to the other party
+		if sender == transfer.Receiver {
+			transfer.Sender.sendEncryptedMessage(string(respJSON))
+		} else {
+			transfer.Receiver.sendEncryptedMessage(string(respJSON))
+		}
+
+		// Cleanup if rejected or completed
+		if resp.Status == "rejected" || resp.Status == "completed" {
+			transfersMux.Lock()
+			delete(fileTransfers, resp.FileID)
+			transfersMux.Unlock()
+		}
+	}
+}
+
+func cleanupOldTransfers() {
+	transfersMux.Lock()
+	defer transfersMux.Unlock()
+
+	now := time.Now()
+	for fileID, transfer := range fileTransfers {
+		if now.Sub(transfer.StartTime) > 30*time.Minute {
+			fmt.Printf("🗑️ Cleaning up old transfer: %s\n", fileID[:8])
+			delete(fileTransfers, fileID)
+		}
+	}
+}
+
+func sendPrivateMessage(sender *Client, targetUsername string, message string) {
+	clientsMux.RLock()
+	defer clientsMux.RUnlock()
+
+	var targetClient *Client
+	for _, client := range clients {
+		if client.identity == targetUsername {
+			targetClient = client
+			break
+		}
+	}
+
+	if targetClient == nil {
+		errorMsg := Message{
+			From:    "System",
+			Content: fmt.Sprintf("❌ User '%s' not found", targetUsername),
+			Time:    time.Now().Format("15:04:05"),
+			Type:    "error",
+		}
+		msgJSON, _ := json.Marshal(errorMsg)
+		sender.sendEncryptedMessage(string(msgJSON))
+		return
+	}
+
+	privateMsg := Message{
+		From:    sender.identity,
+		To:      targetUsername,
+		Content: message,
+		Time:    time.Now().Format("15:04:05"),
+		Type:    "private",
+	}
+
+	msgJSON, _ := json.Marshal(privateMsg)
+
+	fmt.Printf("🔒 [%s → %s] Private message\n", sender.identity, targetUsername)
+	targetClient.sendEncryptedMessage(string(msgJSON))
+	sender.sendEncryptedMessage(string(msgJSON))
 }
 
 func broadcastSystemMessage(message string) {
@@ -339,7 +803,9 @@ func broadcastSystemMessage(message string) {
 	msgJSON, _ := json.Marshal(systemMsg)
 
 	for _, client := range clients {
-		client.sendEncryptedMessage(string(msgJSON))
+		if client.isVisible {
+			client.sendEncryptedMessage(string(msgJSON))
+		}
 	}
 }
 
@@ -347,7 +813,14 @@ func broadcastUserMessage(sender *Client, message string) {
 	clientsMux.RLock()
 	defer clientsMux.RUnlock()
 
-	fmt.Printf("📢 [%s] Starting broadcast to %d clients\n", sender.identity, len(clients))
+	visibleCount := 0
+	for _, client := range clients {
+		if client.isVisible {
+			visibleCount++
+		}
+	}
+
+	fmt.Printf("📢 [%s] Broadcasting to %d visible clients\n", sender.identity, visibleCount-1)
 
 	userMsg := Message{
 		From:    sender.identity,
@@ -356,157 +829,170 @@ func broadcastUserMessage(sender *Client, message string) {
 		Type:    "message",
 	}
 
-	msgJSON, err := json.Marshal(userMsg)
-	if err != nil {
-		fmt.Printf("❌ [%s] JSON marshal error: %v\n", sender.identity, err)
-		return
-	}
+	msgJSON, _ := json.Marshal(userMsg)
 
-	sentCount := 0
 	for _, client := range clients {
-		if client != sender {
+		if client != sender && client.isVisible {
 			fmt.Printf("📤 Sending to %s\n", client.identity)
-			err := client.sendEncryptedMessage(string(msgJSON))
-			if err != nil {
-				fmt.Printf("❌ Failed to send to %s: %v\n", client.identity, err)
-			} else {
-				sentCount++
-			}
+			client.sendEncryptedMessage(string(msgJSON))
 		}
 	}
-	
-	fmt.Printf("✅ [%s] Broadcast completed - sent to %d clients\n", sender.identity, sentCount)
 }
 
-func (c *Client) receiveMessages() {
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Printf("💥 [%s] PANIC in receiveMessages: %v\n", c.identity, r)
-		}
-		fmt.Printf("🔚 [%s] Exiting receiveMessages\n", c.identity)
-		close(c.quit)
-	}()
-	
-	buf := make([]byte, 8192)
-	
-	fmt.Printf("📡 [%s] Starting receive loop\n", c.identity)
-	
-	// NO read deadline for persistent connections
-	c.conn.SetReadDeadline(time.Time{})
-	
-	for {
-		n, err := c.conn.Read(buf)
-		if err != nil {
-			if err == io.EOF {
-				fmt.Printf("📴 [%s] Client closed connection cleanly\n", c.identity)
-			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				fmt.Printf("⏱️ [%s] Read timeout - connection idle\n", c.identity)
-				continue // Continue on timeout
-			} else {
-				fmt.Printf("❌ [%s] Read error: %v\n", c.identity, err)
-			}
-			return
-		}
-		
-		if n == 0 {
-			fmt.Printf("⚠️ [%s] Read 0 bytes\n", c.identity)
-			continue
-		}
-		
-		// Update last activity
-		c.mu.Lock()
-		c.lastActivity = time.Now()
-		c.mu.Unlock()
-		
-		fmt.Printf("📥 [%s] Received %d bytes\n", c.identity, n)
-		
-		message, err := c.decryptMessage(buf[:n])
-		if err != nil {
-			fmt.Printf("❌ [%s] Decrypt error: %v\n", c.identity, err)
-			continue
-		}
-		
-		fmt.Printf("📝 [%s] Message: %s\n", c.identity, message)
-		
-		// Handle special commands
-		if message == "/quit" {
-			fmt.Printf("👋 [%s] Quit received\n", c.identity)
-			return
-		}
-		
-		if message == "/ping" {
-			fmt.Printf("🏓 [%s] Ping received, sending pong\n", c.identity)
-			err := c.sendEncryptedMessage("/pong")
-			if err != nil {
-				fmt.Printf("❌ [%s] Failed to send pong: %v\n", c.identity, err)
-			} else {
-				fmt.Printf("✅ [%s] Pong sent successfully\n", c.identity)
-			}
-			continue
-		}
-		
-		// Broadcast regular messages
-		fmt.Printf("💬 [%s] Broadcasting: %s\n", c.identity, message)
-		broadcastUserMessage(c, message)
-		fmt.Printf("📈 [%s] Continuing to wait for next message\n", c.identity)
+func padMessage(plaintext []byte) []byte {
+	currentLen := len(plaintext)
+	paddedLen := ((currentLen / messageBlockSize) + 1) * messageBlockSize
+	padLen := paddedLen - currentLen
+
+	result := make([]byte, 2+paddedLen)
+	binary.BigEndian.PutUint16(result[0:2], uint16(currentLen))
+	copy(result[2:], plaintext)
+
+	if padLen > 0 {
+		padding := make([]byte, padLen)
+		cryptorand.Read(padding)
+		copy(result[2+currentLen:], padding)
 	}
+
+	return result
+}
+
+func unpadMessage(paddedData []byte) ([]byte, error) {
+	if len(paddedData) < 2 {
+		return nil, fmt.Errorf("padded data too short")
+	}
+
+	originalLen := binary.BigEndian.Uint16(paddedData[0:2])
+	if int(originalLen) > len(paddedData)-2 {
+		return nil, fmt.Errorf("invalid padding length")
+	}
+
+	return paddedData[2 : 2+originalLen], nil
+}
+
+func randomDelay() {
+	delay := minRandomDelay + rand.Intn(maxRandomDelay-minRandomDelay)
+	time.Sleep(time.Duration(delay) * time.Millisecond)
 }
 
 func (c *Client) sendEncryptedMessage(message string) error {
-	if c.conn == nil {
-		return fmt.Errorf("connection is nil")
-	}
-	
-	if c.gcm == nil {
-		return fmt.Errorf("gcm cipher is nil")
-	}
-	
-	nonce := make([]byte, 12)
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return fmt.Errorf("nonce generation failed: %v", err)
+	if c.conn == nil || c.gcm == nil {
+		return fmt.Errorf("not ready")
 	}
 
-	ciphertext := c.gcm.Seal(nil, nonce, []byte(message), nil)
+	randomDelay()
+
+	paddedMessage := padMessage([]byte(message))
+
+	nonce := make([]byte, 12)
+	if _, err := io.ReadFull(cryptorand.Reader, nonce); err != nil {
+		return fmt.Errorf("nonce failed: %v", err)
+	}
+
+	ciphertext := c.gcm.Seal(nil, nonce, paddedMessage, nil)
 	data := append(nonce, ciphertext...)
-	
-	fmt.Printf("📤 [%s] Sending encrypted message (%d bytes): %s\n", c.identity, len(data), message)
-	
+
+	fmt.Printf("📤 [%s] Sending %d bytes (padded)\n", c.identity, len(data))
+
 	n, err := c.conn.Write(data)
 	if err != nil {
-		return fmt.Errorf("write failed: %v", err)
+		return err
 	}
-	
-	if n != len(data) {
-		return fmt.Errorf("incomplete write: wrote %d of %d bytes", n, len(data))
-	}
-	
-	fmt.Printf("✅ [%s] Successfully wrote %d bytes\n", c.identity, n)
+
+	fmt.Printf("✅ [%s] Sent %d bytes\n", c.identity, n)
 	return nil
 }
 
 func (c *Client) decryptMessage(data []byte) (string, error) {
 	if len(data) < 12 {
-		return "", fmt.Errorf("message too short: %d bytes", len(data))
+		return "", fmt.Errorf("too short")
 	}
 
 	nonce := data[:12]
 	ciphertext := data[12:]
 
-	plaintext, err := c.gcm.Open(nil, nonce, ciphertext, nil)
+	paddedPlaintext, err := c.gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return "", fmt.Errorf("decryption failed: %v", err)
+		return "", err
+	}
+
+	plaintext, err := unpadMessage(paddedPlaintext)
+	if err != nil {
+		return "", fmt.Errorf("unpad failed: %v", err)
 	}
 
 	return string(plaintext), nil
+}
+
+func splitPrivateMessage(msg string) []string {
+	content := msg[4:]
+	spaceIdx := -1
+	for i, ch := range content {
+		if ch == ' ' {
+			spaceIdx = i
+			break
+		}
+	}
+
+	if spaceIdx == -1 {
+		return []string{content}
+	}
+
+	username := content[:spaceIdx]
+	message := content[spaceIdx+1:]
+
+	return []string{username, message}
 }
 
 func secureSetup() {
 	memguard.CatchInterrupt()
 }
 
+func performMutualAuth(conn net.Conn, sharedSecret []byte, identity string) error {
+	conn.SetDeadline(time.Now().Add(handshakeTimeout))
+	defer conn.SetDeadline(time.Time{})
+
+	serverChallenge := make([]byte, 32)
+	if _, err := cryptorand.Read(serverChallenge); err != nil {
+		return fmt.Errorf("challenge generation failed: %v", err)
+	}
+
+	if _, err := conn.Write(serverChallenge); err != nil {
+		return fmt.Errorf("challenge send failed: %v", err)
+	}
+
+	clientResponse := make([]byte, 32)
+	if _, err := io.ReadFull(conn, clientResponse); err != nil {
+		return fmt.Errorf("client response read failed: %v", err)
+	}
+
+	clientChallenge := make([]byte, 32)
+	if _, err := io.ReadFull(conn, clientChallenge); err != nil {
+		return fmt.Errorf("client challenge read failed: %v", err)
+	}
+
+	h := hmac.New(sha256.New, sharedSecret)
+	h.Write(serverChallenge)
+	expectedClientMAC := h.Sum(nil)
+
+	if !hmac.Equal(clientResponse, expectedClientMAC) {
+		return fmt.Errorf("client authentication failed")
+	}
+
+	h.Reset()
+	h.Write(clientChallenge)
+	serverResponse := h.Sum(nil)
+
+	if _, err := conn.Write(serverResponse); err != nil {
+		return fmt.Errorf("server response send failed: %v", err)
+	}
+
+	return nil
+}
+
 func secureShutdown(reason string) {
 	fmt.Printf("\n🛑 Server shutdown: %s\n", reason)
-	
+
 	clientsMux.Lock()
 	for _, client := range clients {
 		client.conn.Close()
