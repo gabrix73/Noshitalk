@@ -5,15 +5,21 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
-	"crypto/rand"
-	"crypto/tls"
+	"crypto/hmac"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,15 +32,44 @@ import (
 type CLIClient struct {
 	conn          net.Conn
 	gcm           cipher.AEAD
+	sharedSecret  *memguard.Enclave
 	connected     bool
 	serverAddr    string
 	quit          chan struct{}
 	mu            sync.Mutex
 	autoReconnect bool
 	lastServer    string
+	onlineUsers   []string
+
+	// Persistent identity
+	privateKey    *ecdh.PrivateKey
+	identity      string
 }
 
-var version = "0.1"
+type Message struct {
+	From    string `json:"from"`
+	To      string `json:"to,omitempty"`
+	Content string `json:"content"`
+	Time    string `json:"time"`
+	Type    string `json:"type"`
+}
+
+type UserListMessage struct {
+	Type  string   `json:"type"`
+	Users []string `json:"users"`
+	Time  string   `json:"time"`
+}
+
+var (
+	version    = "0.8-identity"
+	onionRegex = regexp.MustCompile(`^[a-z2-7]{56}\.onion(:[0-9]{1,5})?$`)
+)
+
+const (
+	messageBlockSize = 256
+	minRandomDelay   = 50
+	maxRandomDelay   = 200
+)
 
 func main() {
 	memguard.CatchInterrupt()
@@ -42,11 +77,19 @@ func main() {
 
 	fmt.Printf("🔐 NoshiTalk CLI Client v%s\n", version)
 	fmt.Printf("💻 Lightweight Command Line Interface\n")
-	fmt.Printf("🧅 Tor Support Built-in\n\n")
+	fmt.Printf("🧅 Tor-Only Mode - No Clearnet Connections\n")
+	fmt.Printf("🔒 ECDH + HMAC + AES-GCM Encryption\n\n")
 
 	client := &CLIClient{
 		quit:          make(chan struct{}),
 		autoReconnect: true,
+		onlineUsers:   []string{},
+	}
+
+	// Initialize persistent identity
+	if err := client.initializeIdentity(); err != nil {
+		fmt.Printf("❌ Failed to initialize identity: %v\n", err)
+		fmt.Printf("   Continuing with temporary identity...\n\n")
 	}
 
 	// Setup signal handling
@@ -63,33 +106,38 @@ func main() {
 	// Start auto-reconnect goroutine
 	go client.autoReconnectLoop()
 
-	// Start heartbeat
-	go client.heartbeatLoop()
-
 	client.run()
 }
 
 func (c *CLIClient) run() {
 	scanner := bufio.NewScanner(os.Stdin)
 
-	fmt.Printf("📡 Enter server address (or press Enter for localhost:8083)\n")
-	fmt.Printf("💡 Tip: Use .onion addresses for maximum anonymity\n\n")
+	fmt.Printf("📡 Enter Tor Hidden Service address (.onion only)\n")
+	fmt.Printf("💡 Example: abcd1234...xyz9876.onion:8083\n")
+	fmt.Printf("⚠️  Clearnet addresses blocked by design\n\n")
 
 	for {
 		if !c.connected {
-			fmt.Print("🔗 Server [localhost:8083]: ")
+			fmt.Print("🧅 .onion address: ")
 			if !scanner.Scan() {
 				break
 			}
 			c.serverAddr = strings.TrimSpace(scanner.Text())
-			
+
 			if c.serverAddr == "" {
-				c.serverAddr = "localhost:8083"
+				fmt.Printf("❌ Address required\n\n")
+				continue
+			}
+
+			// Validate .onion address
+			if err := validateOnionAddress(c.serverAddr); err != nil {
+				fmt.Printf("❌ Invalid address: %v\n\n", err)
+				continue
 			}
 
 			c.lastServer = c.serverAddr
-			fmt.Printf("⏳ Connecting to %s...\n", c.serverAddr)
-			
+			fmt.Printf("⏳ Connecting to %s via Tor...\n", c.serverAddr)
+
 			if err := c.connect(); err != nil {
 				fmt.Printf("❌ Connection failed: %v\n", err)
 				fmt.Printf("💡 Will retry automatically if auto-reconnect is enabled\n\n")
@@ -141,6 +189,23 @@ func (c *CLIClient) run() {
 		case "/clear", "/cls":
 			fmt.Print("\033[H\033[2J")
 			continue
+		case "/users", "/u":
+			c.showUsers()
+			continue
+		}
+
+		// Handle /pm command
+		if len(message) > 4 && message[:4] == "/pm " {
+			if !c.connected {
+				fmt.Printf("❌ Not connected. Use /reconnect or enter server address\n")
+				continue
+			}
+			// Send directly - server will parse it
+			if err := c.sendMessage(message); err != nil {
+				fmt.Printf("❌ Send error: %v\n", err)
+				c.disconnect()
+			}
+			continue
 		}
 
 		// Send regular message
@@ -158,6 +223,22 @@ func (c *CLIClient) run() {
 	c.disconnect()
 }
 
+func validateOnionAddress(addr string) error {
+	if addr == "" {
+		return fmt.Errorf("address cannot be empty")
+	}
+
+	if !strings.Contains(addr, ".onion") {
+		return fmt.Errorf("only Tor .onion addresses allowed - no clearnet connections")
+	}
+
+	if !onionRegex.MatchString(addr) {
+		return fmt.Errorf("invalid .onion address format (must be v3: 56 chars + .onion:port)")
+	}
+
+	return nil
+}
+
 func (c *CLIClient) connect() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -166,21 +247,9 @@ func (c *CLIClient) connect() error {
 		return nil
 	}
 
-	// Detect if it's an .onion address
-	isOnion := strings.HasSuffix(c.serverAddr, ".onion") || 
-			  strings.Contains(c.serverAddr, ".onion:")
-
-	var conn net.Conn
-	var err error
-
-	if isOnion {
-		fmt.Printf("🧅 Detected .onion address - routing through Tor\n")
-		conn, err = c.connectThroughTor()
-	} else {
-		fmt.Printf("🌐 Connecting directly\n")
-		conn, err = c.connectDirect()
-	}
-
+	// Only Tor connections allowed
+	fmt.Printf("🧅 Routing through Tor network...\n")
+	conn, err := c.connectThroughTor()
 	if err != nil {
 		return err
 	}
@@ -244,37 +313,11 @@ func (c *CLIClient) connectThroughTor() (net.Conn, error) {
 		return nil, fmt.Errorf("all Tor proxy attempts failed: %v", lastErr)
 	}
 
-	fmt.Printf("🔐 Establishing TLS over Tor...\n")
+	fmt.Printf("✅ TCP connection through Tor established\n")
+	fmt.Printf("✅ Tor circuit complete (3-layer encryption)\n")
+	fmt.Printf("🔒 Proceeding to ECDH handshake...\n")
 
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         "",
-		MinVersion:         tls.VersionTLS12,
-		MaxVersion:         tls.VersionTLS13,
-		CipherSuites: []uint16{
-			tls.TLS_AES_256_GCM_SHA384,
-			tls.TLS_CHACHA20_POLY1305_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-		},
-		CurvePreferences: []tls.CurveID{
-			tls.X25519,
-			tls.CurveP256,
-		},
-	}
-
-	tlsConn := tls.Client(conn, tlsConfig)
-	tlsConn.SetDeadline(time.Now().Add(45 * time.Second))
-	
-	if err := tlsConn.Handshake(); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("TLS handshake failed: %v", err)
-	}
-	
-	tlsConn.SetDeadline(time.Time{})
-	
-	fmt.Printf("✅ Secure Tor connection established\n")
-	return tlsConn, nil
+	return conn, nil
 }
 
 func (c *CLIClient) testTorProxy() error {
@@ -288,56 +331,32 @@ func (c *CLIClient) testTorProxy() error {
 	return nil
 }
 
-func (c *CLIClient) connectDirect() (net.Conn, error) {
-	fmt.Printf("📡 Establishing direct connection...\n")
-	
-	conn, err := net.DialTimeout("tcp", c.serverAddr, 10*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("TCP connection failed: %v", err)
-	}
-
-	fmt.Printf("🔐 Starting TLS handshake...\n")
-	
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-		MinVersion:         tls.VersionTLS12,
-		CipherSuites: []uint16{
-			tls.TLS_AES_256_GCM_SHA384,
-			tls.TLS_CHACHA20_POLY1305_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-		},
-		CurvePreferences: []tls.CurveID{
-			tls.X25519,
-			tls.CurveP256,
-			tls.CurveP384,
-		},
-	}
-
-	tlsConn := tls.Client(conn, tlsConfig)
-	if err := tlsConn.Handshake(); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("TLS handshake failed: %v", err)
-	}
-
-	fmt.Printf("✅ Secure connection established\n")
-	return tlsConn, nil
-}
-
 func (c *CLIClient) setupEncryption() error {
 	fmt.Printf("🔐 Establishing end-to-end encryption...\n")
-	
-	// ECDH Key Exchange
+
+	// X25519 curve for key exchange
 	curve := ecdh.X25519()
-	privateKey, err := curve.GenerateKey(rand.Reader)
-	if err != nil {
-		c.conn.Close()
-		return fmt.Errorf("key generation failed: %v", err)
+
+	// Use persistent identity key (or generate temporary if not available)
+	var privateKey *ecdh.PrivateKey
+	if c.privateKey != nil {
+		privateKey = c.privateKey
+		fmt.Printf("🔑 Using persistent identity: %s\n", c.identity)
+	} else {
+		// Fallback: generate temporary key
+		var err error
+		privateKey, err = curve.GenerateKey(cryptorand.Reader)
+		if err != nil {
+			c.conn.Close()
+			return fmt.Errorf("key generation failed: %v", err)
+		}
+		fmt.Printf("⚠️  Using temporary identity (will change on reconnect)\n")
 	}
 
 	privateKeyBuffer := memguard.NewBufferFromBytes(privateKey.Bytes())
 	defer privateKeyBuffer.Destroy()
 
-	// Send public key
+	// Send public key (this identifies us to the server)
 	publicKey := privateKey.PublicKey()
 	publicKeyBytes := publicKey.Bytes()
 	
@@ -373,11 +392,17 @@ func (c *CLIClient) setupEncryption() error {
 		return fmt.Errorf("ECDH failed: %v", err)
 	}
 
-	sharedSecretBuffer := memguard.NewBufferFromBytes(sharedSecret)
-	defer sharedSecretBuffer.Destroy()
+	// Use sharedSecret directly, seal into memguard after we're done
+	// HMAC Mutual Authentication
+	fmt.Printf("🔐 Starting HMAC mutual authentication...\n")
+	if err := c.performMutualAuth(sharedSecret); err != nil {
+		c.conn.Close()
+		return fmt.Errorf("authentication failed: %v", err)
+	}
+	fmt.Printf("✅ Mutual authentication successful\n")
 
 	// Setup AES-GCM
-	block, err := aes.NewCipher(sharedSecret)
+	block, err := aes.NewCipher(sharedSecret[:32])
 	if err != nil {
 		c.conn.Close()
 		return fmt.Errorf("AES cipher creation failed: %v", err)
@@ -389,18 +414,19 @@ func (c *CLIClient) setupEncryption() error {
 		return fmt.Errorf("GCM cipher creation failed: %v", err)
 	}
 
+	// Now seal sharedSecret into memguard (this zeros the original)
+	sharedSecretBuffer := memguard.NewBufferFromBytes(sharedSecret)
+	defer sharedSecretBuffer.Destroy()
+
 	c.gcm = gcm
+	c.sharedSecret = sharedSecretBuffer.Seal()
 	c.connected = true
 
 	// Success messages
 	fmt.Printf("✅ Connected to %s\n", c.serverAddr)
 	fmt.Printf("🔐 End-to-end encryption active (AES-256-GCM)\n")
-	
-	if strings.Contains(c.serverAddr, ".onion") {
-		fmt.Printf("🧅 Anonymous Tor routing active\n")
-		fmt.Printf("👻 Your identity is protected\n")
-	}
-	
+	fmt.Printf("🧅 Anonymous Tor routing active\n")
+	fmt.Printf("🔒 ECDH + HMAC + AES-GCM protection\n")
 	fmt.Printf("💬 Ready for secure messaging\n")
 	fmt.Printf("ℹ️  Type /help for commands\n\n")
 
@@ -410,25 +436,82 @@ func (c *CLIClient) setupEncryption() error {
 	return nil
 }
 
+func (c *CLIClient) performMutualAuth(sharedSecret []byte) error {
+	c.conn.SetDeadline(time.Now().Add(30 * time.Second))
+	defer c.conn.SetDeadline(time.Time{})
+
+	// Step 1: Receive server challenge
+	serverChallenge := make([]byte, 32)
+	if _, err := io.ReadFull(c.conn, serverChallenge); err != nil {
+		return fmt.Errorf("receive server challenge failed: %v", err)
+	}
+
+	// Step 2: Compute HMAC response to server's challenge
+	h := hmac.New(sha256.New, sharedSecret)
+	h.Write(serverChallenge)
+	clientResponse := h.Sum(nil)
+
+	// Step 3: Generate client's own challenge
+	clientChallenge := make([]byte, 32)
+	if _, err := cryptorand.Read(clientChallenge); err != nil {
+		return fmt.Errorf("challenge generation failed: %v", err)
+	}
+
+	// Step 4: Send client response + client challenge
+	if _, err := c.conn.Write(clientResponse); err != nil {
+		return fmt.Errorf("send client response failed: %v", err)
+	}
+	if _, err := c.conn.Write(clientChallenge); err != nil {
+		return fmt.Errorf("send client challenge failed: %v", err)
+	}
+
+	// Step 5: Receive and verify server's response
+	serverResponse := make([]byte, 32)
+	if _, err := io.ReadFull(c.conn, serverResponse); err != nil {
+		return fmt.Errorf("receive server response failed: %v", err)
+	}
+
+	h.Reset()
+	h.Write(clientChallenge)
+	expectedServerMAC := h.Sum(nil)
+
+	if !hmac.Equal(serverResponse, expectedServerMAC) {
+		return fmt.Errorf("server authentication failed - HMAC mismatch")
+	}
+
+	return nil
+}
+
 func (c *CLIClient) disconnect() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	if !c.connected {
 		return
 	}
 
 	c.sendEncryptedMessage("/quit")
 	time.Sleep(100 * time.Millisecond)
-	
+
 	if c.conn != nil {
 		c.conn.Close()
 		c.conn = nil
 	}
-	
+
+	if c.sharedSecret != nil {
+		// Open enclave and destroy the buffer
+		buf, _ := c.sharedSecret.Open()
+		if buf != nil {
+			buf.Destroy()
+		}
+		c.sharedSecret = nil
+	}
+	c.gcm = nil
+
 	c.connected = false
 	fmt.Printf("\n📴 Disconnected from server\n")
-	
+	fmt.Printf("🔒 Keys wiped from memory\n")
+
 	if c.autoReconnect {
 		fmt.Printf("🔄 Auto-reconnect is enabled\n")
 	}
@@ -439,22 +522,65 @@ func (c *CLIClient) sendMessage(message string) error {
 	return c.sendEncryptedMessage(message)
 }
 
+func padMessage(plaintext []byte) []byte {
+	currentLen := len(plaintext)
+	paddedLen := ((currentLen / messageBlockSize) + 1) * messageBlockSize
+	padLen := paddedLen - currentLen
+
+	result := make([]byte, 2+paddedLen)
+	binary.BigEndian.PutUint16(result[0:2], uint16(currentLen))
+	copy(result[2:], plaintext)
+
+	if padLen > 0 {
+		padding := make([]byte, padLen)
+		cryptorand.Read(padding)
+		copy(result[2+currentLen:], padding)
+	}
+
+	return result
+}
+
+func unpadMessage(paddedData []byte) ([]byte, error) {
+	if len(paddedData) < 2 {
+		return nil, fmt.Errorf("padded data too short")
+	}
+
+	originalLen := binary.BigEndian.Uint16(paddedData[0:2])
+
+	if int(originalLen) > len(paddedData)-2 {
+		return nil, fmt.Errorf("invalid padding length")
+	}
+
+	return paddedData[2 : 2+originalLen], nil
+}
+
+func randomDelay() {
+	delay := minRandomDelay + rand.Intn(maxRandomDelay-minRandomDelay)
+	time.Sleep(time.Duration(delay) * time.Millisecond)
+}
+
 func (c *CLIClient) sendEncryptedMessage(message string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	if !c.connected || c.gcm == nil || c.conn == nil {
 		return fmt.Errorf("not connected")
 	}
 
+	// Random delay (timing attack mitigation)
+	randomDelay()
+
+	// Pad message
+	paddedMessage := padMessage([]byte(message))
+
 	nonce := make([]byte, 12)
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+	if _, err := io.ReadFull(cryptorand.Reader, nonce); err != nil {
 		return fmt.Errorf("nonce generation failed: %v", err)
 	}
 
-	encrypted := c.gcm.Seal(nil, nonce, []byte(message), nil)
+	encrypted := c.gcm.Seal(nil, nonce, paddedMessage, nil)
 	data := append(nonce, encrypted...)
-	
+
 	_, err := c.conn.Write(data)
 	return err
 }
@@ -497,38 +623,49 @@ func (c *CLIClient) receiveMessages() {
 		nonce := buf[:12]
 		ciphertext := buf[12:n]
 
-		decrypted, err := gcm.Open(nil, nonce, ciphertext, nil)
+		paddedPlaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 		if err != nil {
 			fmt.Printf("\n⚠️ Failed to decrypt message\n")
 			continue
 		}
 
-		message := string(decrypted)
-		
-		// Handle special commands
-		if message == "/pong" {
-			// Heartbeat response - don't display
+		// Remove padding
+		plaintext, err := unpadMessage(paddedPlaintext)
+		if err != nil {
+			fmt.Printf("\n⚠️ Failed to unpad message: %v\n", err)
 			continue
 		}
 
-		// Try to parse as JSON
-		var msg struct {
-			From    string `json:"from"`
-			Content string `json:"content"`
-			Type    string `json:"type"`
-			Time    string `json:"time"`
+		// Try to parse as UserListMessage first
+		var userListMsg UserListMessage
+		if err := json.Unmarshal(plaintext, &userListMsg); err == nil && userListMsg.Type == "user_list" {
+			c.mu.Lock()
+			c.onlineUsers = userListMsg.Users
+			c.mu.Unlock()
+			fmt.Printf("\r👥 Online users (%d): %s\n💬 > ", len(userListMsg.Users), strings.Join(userListMsg.Users, ", "))
+			continue
 		}
-		
-		if err := json.Unmarshal(decrypted, &msg); err == nil {
+
+		// Try to parse as Message
+		var msg Message
+		if err := json.Unmarshal(plaintext, &msg); err == nil {
 			timestamp := msg.Time
 			if timestamp == "" {
 				timestamp = time.Now().Format("15:04:05")
 			}
-			
+
 			switch msg.Type {
 			case "system":
 				fmt.Printf("\r🔔 [%s] %s\n💬 > ", timestamp, msg.Content)
+			case "private":
+				if msg.To != "" {
+					// Private message
+					fmt.Printf("\r🔒 [%s] PM from %s: %s\n💬 > ", timestamp, msg.From, msg.Content)
+				}
+			case "error":
+				fmt.Printf("\r❌ [%s] %s\n💬 > ", timestamp, msg.Content)
 			default:
+				// Regular message
 				if msg.From == "" {
 					fmt.Printf("\r📨 [%s] %s\n💬 > ", timestamp, msg.Content)
 				} else {
@@ -536,9 +673,9 @@ func (c *CLIClient) receiveMessages() {
 				}
 			}
 		} else {
-			// Plain message
+			// Plain message fallback
 			timestamp := time.Now().Format("15:04:05")
-			fmt.Printf("\r📨 [%s] %s\n💬 > ", timestamp, message)
+			fmt.Printf("\r📨 [%s] %s\n💬 > ", timestamp, string(plaintext))
 		}
 	}
 }
@@ -569,22 +706,6 @@ func (c *CLIClient) autoReconnectLoop() {
 	}
 }
 
-func (c *CLIClient) heartbeatLoop() {
-	for {
-		time.Sleep(30 * time.Second)
-		
-		c.mu.Lock()
-		if c.connected {
-			c.mu.Unlock()
-			if err := c.sendEncryptedMessage("/ping"); err != nil {
-				fmt.Printf("\n⚠️ Heartbeat failed\n")
-			}
-		} else {
-			c.mu.Unlock()
-		}
-	}
-}
-
 func (c *CLIClient) showStatus() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -593,13 +714,10 @@ func (c *CLIClient) showStatus() {
 	fmt.Printf("  Connected: %v\n", c.connected)
 	if c.connected {
 		fmt.Printf("  Server: %s\n", c.serverAddr)
-		if strings.Contains(c.serverAddr, ".onion") {
-			fmt.Printf("  Mode: Tor (Anonymous)\n")
-		} else {
-			fmt.Printf("  Mode: Direct\n")
-		}
+		fmt.Printf("  Mode: Tor Hidden Service (Anonymous)\n")
 		fmt.Printf("  Encryption: AES-256-GCM\n")
 		fmt.Printf("  Key Exchange: ECDH-X25519\n")
+		fmt.Printf("  Authentication: HMAC-SHA256\n")
 	}
 	fmt.Printf("  Auto-Reconnect: %v\n", c.autoReconnect)
 	fmt.Printf("  Version: %s\n\n", version)
@@ -615,21 +733,137 @@ Connection:
   /reconnect, /r     - Reconnect to last server
   /disconnect, /d    - Disconnect from server
   /status, /s        - Show connection status
-  
+
+Messaging:
+  /users, /u         - Show online users
+  /pm user message   - Send private message
+
 Settings:
   /auto on           - Enable auto-reconnect
   /auto off          - Disable auto-reconnect
-  
+
 Interface:
   /clear, /cls       - Clear screen
   /help, /h, /?      - Show this help
   /quit, /exit, /q   - Exit application
-  
+
 Tips:
-  • .onion addresses route through Tor automatically
+  • Only .onion addresses accepted (Tor-only mode)
   • All messages are end-to-end encrypted
+  • ECDH + HMAC + AES-GCM protection
   • Auto-reconnect keeps you connected
   • Press Ctrl+C for emergency shutdown
+  • Clearnet connections blocked by design
+
+Examples:
+  /pm alice Hey, how are you?
+  /users
 
 `, version)
+}
+
+func (c *CLIClient) showUsers() {
+	c.mu.Lock()
+	users := c.onlineUsers
+	c.mu.Unlock()
+
+	if len(users) == 0 {
+		fmt.Printf("👥 No users online (or not yet received user list)\n")
+		return
+	}
+
+	fmt.Printf("👥 Online users (%d):\n", len(users))
+	for _, user := range users {
+		fmt.Printf("   • %s\n", user)
+	}
+}
+
+// Identity management functions
+
+func (c *CLIClient) initializeIdentity() error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	keyPath := filepath.Join(homeDir, ".noshitalk", "identity.key")
+
+	// Try to load existing key
+	if _, err := os.Stat(keyPath); err == nil {
+		return c.loadIdentity(keyPath)
+	}
+
+	// Generate new key pair
+	return c.generateNewIdentity(keyPath)
+}
+
+func (c *CLIClient) generateNewIdentity(keyPath string) error {
+	fmt.Printf("🔑 No identity found. Generating new anonymous identity...\n")
+
+	curve := ecdh.X25519()
+	privKey, err := curve.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		return err
+	}
+
+	pubKey := privKey.PublicKey().Bytes()
+
+	// Derive identity from public key
+	hash := sha256.Sum256(pubKey)
+	identity := fmt.Sprintf("anon_%s", hex.EncodeToString(hash[:8]))
+
+	c.privateKey = privKey
+	c.identity = identity
+
+	fmt.Printf("✅ Identity created: %s\n", identity)
+	fmt.Printf("   (will be saved to %s)\n\n", keyPath)
+
+	// Save to disk
+	return c.saveIdentity(keyPath)
+}
+
+func (c *CLIClient) loadIdentity(keyPath string) error {
+	fmt.Printf("🔑 Loading identity from %s\n", keyPath)
+
+	data, err := os.ReadFile(keyPath)
+	if err != nil {
+		return err
+	}
+
+	curve := ecdh.X25519()
+	privKey, err := curve.NewPrivateKey(data)
+	if err != nil {
+		return err
+	}
+
+	pubKey := privKey.PublicKey().Bytes()
+
+	// Derive identity
+	hash := sha256.Sum256(pubKey)
+	identity := fmt.Sprintf("anon_%s", hex.EncodeToString(hash[:8]))
+
+	c.privateKey = privKey
+	c.identity = identity
+
+	fmt.Printf("✅ Identity loaded: %s\n\n", identity)
+
+	return nil
+}
+
+func (c *CLIClient) saveIdentity(keyPath string) error {
+	// Create directory if needed
+	dir := filepath.Dir(keyPath)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+
+	// Save private key
+	privKeyBytes := c.privateKey.Bytes()
+
+	if err := os.WriteFile(keyPath, privKeyBytes, 0600); err != nil {
+		return err
+	}
+
+	fmt.Printf("💾 Identity saved securely\n")
+	return nil
 }
