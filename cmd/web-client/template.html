@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NoshiTalk - Anonymous Encrypted Chat</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0a; color: #e0e0e0; height: 100vh; overflow: hidden; }
+        .header { background: linear-gradient(135deg, #1a1a1a 0%, #0f0f0f 100%); padding: 1rem 1.5rem; border-bottom: 2px solid #00f2fe; display: flex; justify-content: space-between; align-items: center; }
+        .logo { font-size: 1.3rem; font-weight: 700; color: #00f2fe; }
+        .header-controls { display: flex; gap: 1rem; align-items: center; }
+        .connection-status { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; }
+        .status-dot { width: 10px; height: 10px; border-radius: 50%; background: #51cf66; animation: pulse 2s infinite; }
+        .status-dot.disconnected { background: #ff6b6b; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .panic-button { background: #ff6b6b; color: white; border: none; padding: 0.6rem 1.2rem; border-radius: 6px; font-weight: 700; cursor: pointer; }
+        .panic-button:hover { background: #ff5252; }
+        .logout-button { background: #333; color: #e0e0e0; border: none; padding: 0.6rem 1.2rem; border-radius: 6px; font-weight: 600; cursor: pointer; }
+        .login-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(10, 10, 10, 0.98); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+        .login-box { background: #1a1a1a; border: 2px solid #00f2fe; border-radius: 8px; padding: 2.5rem; max-width: 500px; width: 90%; }
+        .login-box h2 { color: #00f2fe; margin-bottom: 0.5rem; text-align: center; }
+        .login-subtitle { text-align: center; color: #888; font-size: 0.9rem; margin-bottom: 2rem; }
+        .security-info { background: #0f0f0f; border-left: 3px solid #51cf66; padding: 1rem; margin-bottom: 1.5rem; font-size: 0.85rem; }
+        .warning-info { background: #2a1a1a; border-left: 3px solid #ff6b6b; padding: 1rem; margin-bottom: 1.5rem; font-size: 0.85rem; color: #ffb3b3; }
+        .tab-buttons { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; }
+        .tab-button { flex: 1; background: #0f0f0f; border: 1px solid #333; color: #888; padding: 0.8rem; border-radius: 6px; cursor: pointer; font-weight: 600; }
+        .tab-button.active { background: #00f2fe; color: #0a0a0a; border-color: #00f2fe; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .login-box input { width: 100%; background: #0f0f0f; border: 1px solid #333; color: #e0e0e0; padding: 1rem; border-radius: 6px; font-size: 1rem; margin-bottom: 1rem; }
+        .login-box input:focus { outline: none; border-color: #00f2fe; }
+        .login-box button.primary { width: 100%; background: linear-gradient(135deg, #00f2fe 0%, #00d4e8 100%); color: #0a0a0a; border: none; padding: 1rem; border-radius: 6px; font-weight: 700; cursor: pointer; }
+        .login-box button.primary:hover { box-shadow: 0 5px 15px rgba(0, 242, 254, 0.4); }
+        .spinner { border: 3px solid #333; border-top: 3px solid #00f2fe; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 1rem auto; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .identity-info { background: #0f0f0f; padding: 1rem; border-radius: 6px; margin-top: 1rem; font-size: 0.85rem; }
+        .identity-info .label { color: #888; margin-bottom: 0.3rem; }
+        .identity-info .value { color: #00f2fe; font-family: monospace; word-break: break-all; }
+        .save-keys-button { width: 100%; background: #333; color: #e0e0e0; border: 1px solid #00f2fe; padding: 0.8rem; border-radius: 6px; font-weight: 600; cursor: pointer; margin-top: 1rem; }
+        .container { display: flex; height: calc(100vh - 70px); }
+        .sidebar { width: 250px; background: #0f0f0f; border-right: 1px solid #333; display: flex; flex-direction: column; }
+        .events-panel { background: #1a1a1a; border-bottom: 1px solid #333; padding: 1rem; max-height: 150px; overflow-y: auto; }
+        .events-panel h3 { font-size: 0.85rem; color: #00f2fe; margin-bottom: 0.5rem; }
+        .event-item { font-size: 0.75rem; color: #888; padding: 0.3rem 0; border-bottom: 1px solid #222; }
+        .users-panel { flex: 1; padding: 1rem; overflow-y: auto; }
+        .users-panel h3 { font-size: 0.9rem; color: #00f2fe; margin-bottom: 1rem; }
+        .user-item { display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem; margin-bottom: 0.3rem; background: #1a1a1a; border-radius: 4px; cursor: pointer; }
+        .user-item:hover { background: #222; }
+        .user-avatar { width: 32px; height: 32px; border-radius: 50%; background: linear-gradient(135deg, #00f2fe 0%, #00d4e8 100%); display: flex; align-items: center; justify-content: center; font-weight: 700; color: #0a0a0a; }
+        .main-chat { flex: 1; display: flex; flex-direction: column; }
+        .chat-header { padding: 1rem 1.5rem; background: #0f0f0f; border-bottom: 1px solid #333; }
+        .chat-header h2 { font-size: 1.1rem; color: #00f2fe; }
+        .messages-area { flex: 1; padding: 1.5rem; overflow-y: auto; }
+        .message { display: flex; gap: 1rem; margin-bottom: 1.5rem; animation: fadeIn 0.3s; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .message-avatar { width: 40px; height: 40px; border-radius: 50%; background: linear-gradient(135deg, #00f2fe 0%, #00d4e8 100%); display: flex; align-items: center; justify-content: center; font-weight: 700; color: #0a0a0a; }
+        .message-content { flex: 1; }
+        .message-header { display: flex; gap: 0.5rem; margin-bottom: 0.3rem; }
+        .message-author { font-weight: 600; color: #00f2fe; }
+        .message-time { font-size: 0.75rem; color: #666; }
+        .message-text { color: #c0c0c0; line-height: 1.5; }
+        .input-area { padding: 1.5rem; background: #0f0f0f; border-top: 1px solid #333; }
+        .input-container { display: flex; gap: 1rem; }
+        .message-input { flex: 1; background: #1a1a1a; border: 1px solid #333; color: #e0e0e0; padding: 0.8rem; border-radius: 6px; font-size: 0.95rem; }
+        .message-input:focus { outline: none; border-color: #00f2fe; }
+        .send-button { background: linear-gradient(135deg, #00f2fe 0%, #00d4e8 100%); color: #0a0a0a; border: none; padding: 0.8rem 2rem; border-radius: 6px; font-weight: 600; cursor: pointer; }
+        .system-message { text-align: center; color: #666; font-size: 0.85rem; padding: 0.5rem; margin: 1rem 0; }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #0a0a0a; }
+        ::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <div class="login-overlay" id="login-overlay">
+        <div class="login-box">
+            <h2>NoshiTalk Secure Entry</h2>
+            <p class="login-subtitle">Cryptographic Identity Required</p>
+            <div class="security-info">
+                <strong>Key generation protects:</strong>
+                <ul style="margin: 0.5rem 0 0 1.5rem;">
+                    <li>Your IDENTITY (cryptographic fingerprint)</li>
+                    <li>Your LOGIN (challenge-response auth)</li>
+                </ul>
+            </div>
+            <div class="warning-info">
+                EPHEMERAL: All messages exist only in RAM. Close tab = everything deleted.
+            </div>
+            <div class="tab-buttons">
+                <button class="tab-button active" onclick="switchLoginTab('new')">New Identity</button>
+                <button class="tab-button" onclick="switchLoginTab('load')">Load Identity</button>
+            </div>
+            <div id="new-identity-tab" class="tab-content active">
+                <input type="text" id="username-input" placeholder="Choose your name..." autocomplete="off">
+                <button class="primary" onclick="generateKeysAndConnect()" id="generate-btn">Generate Keys & Enter</button>
+                <div id="generating-status" style="display: none;">
+                    <div style="text-align: center; padding: 1rem; color: #00f2fe;"><div class="spinner"></div>Generating keys...</div>
+                </div>
+                <div id="identity-display" style="display: none;">
+                    <div class="identity-info">
+                        <div class="label">Your Fingerprint:</div>
+                        <div class="value" id="fingerprint-display"></div>
+                    </div>
+                    <button class="save-keys-button" onclick="saveKeys()">Save Keys (.noshikey)</button>
+                    <button class="primary" onclick="connectToServer()" style="margin-top: 1rem;">Enter Chat</button>
+                </div>
+            </div>
+            <div id="load-identity-tab" class="tab-content">
+                <input type="file" id="key-file-input" accept=".noshikey">
+                <button class="primary" onclick="loadKeysAndConnect()">Load Keys & Enter</button>
+            </div>
+        </div>
+    </div>
+    <header class="header" style="display: none;" id="main-header">
+        <div class="logo">NoshiTalk</div>
+        <div class="header-controls">
+            <div class="connection-status">
+                <span class="status-dot" id="status-dot"></span>
+                <span id="status-text">Connecting...</span>
+            </div>
+            <button class="logout-button" onclick="logout()">Logout</button>
+            <button class="panic-button" onclick="panic()">PANIC</button>
+        </div>
+    </header>
+    <div class="container" style="display: none;" id="main-container">
+        <aside class="sidebar">
+            <div class="events-panel">
+                <h3>Events</h3>
+                <div id="events-list"></div>
+            </div>
+            <div class="users-panel">
+                <h3>Online <span id="user-count">(0)</span></h3>
+                <div id="users-list"></div>
+            </div>
+        </aside>
+        <main class="main-chat">
+            <div class="chat-header">
+                <h2>Public Chat</h2>
+                <p style="font-size: 0.8rem; color: #888;">E2E Encrypted - Ephemeral - Zero Storage</p>
+            </div>
+            <div class="messages-area" id="messages-area"></div>
+            <div class="input-area">
+                <div class="input-container">
+                    <input type="text" class="message-input" id="message-input" placeholder="Type your message..." autocomplete="off">
+                    <button class="send-button" onclick="sendMessage()">Send</button>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/js-sha256/0.9.0/sha256.min.js"></script>
+    <script>
+        var ws = null;
+        var state = { currentUser: '', fingerprint: '', users: [], keys: null };
+
+        function switchLoginTab(tab) {
+            document.querySelectorAll('.tab-button').forEach(function(btn) { btn.classList.remove('active'); });
+            document.querySelectorAll('.tab-content').forEach(function(content) { content.classList.remove('active'); });
+            if (tab === 'new') {
+                document.querySelector('.tab-button').classList.add('active');
+                document.getElementById('new-identity-tab').classList.add('active');
+            } else {
+                document.querySelectorAll('.tab-button')[1].classList.add('active');
+                document.getElementById('load-identity-tab').classList.add('active');
+            }
+        }
+
+        async function generateKeysAndConnect() {
+            var username = document.getElementById('username-input').value.trim();
+            if (!username) { alert('Please enter a name'); return; }
+            document.getElementById('generate-btn').disabled = true;
+            document.getElementById('generating-status').style.display = 'block';
+            try {
+                var signKeyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+                var encryptKeyPair = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveKey"]);
+                var pubKey = await crypto.subtle.exportKey("raw", signKeyPair.publicKey);
+                var fingerprint = sha256(new Uint8Array(pubKey)).substring(0, 16);
+                state.keys = { sign: signKeyPair, encrypt: encryptKeyPair };
+                state.fingerprint = fingerprint;
+                state.currentUser = username;
+                document.getElementById('generating-status').style.display = 'none';
+                document.getElementById('identity-display').style.display = 'block';
+                document.getElementById('fingerprint-display').textContent = fingerprint;
+                setTimeout(connectToServer, 1000);
+            } catch (e) {
+                alert('Key generation failed');
+                document.getElementById('generate-btn').disabled = false;
+                document.getElementById('generating-status').style.display = 'none';
+            }
+        }
+
+        async function saveKeys() {
+            try {
+                var signPriv = await crypto.subtle.exportKey("jwk", state.keys.sign.privateKey);
+                var signPub = await crypto.subtle.exportKey("jwk", state.keys.sign.publicKey);
+                var encPriv = await crypto.subtle.exportKey("jwk", state.keys.encrypt.privateKey);
+                var encPub = await crypto.subtle.exportKey("jwk", state.keys.encrypt.publicKey);
+                var data = { version: "1.0", name: state.currentUser, fingerprint: state.fingerprint, signKeyPair: { privateKey: signPriv, publicKey: signPub }, encryptKeyPair: { privateKey: encPriv, publicKey: encPub } };
+                var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                var a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = state.currentUser.toLowerCase() + '.noshikey';
+                a.click();
+            } catch (e) { alert('Failed to save keys'); }
+        }
+
+        async function loadKeysAndConnect() {
+            var file = document.getElementById('key-file-input').files[0];
+            if (!file) { alert('Please select a file'); return; }
+            try {
+                var data = JSON.parse(await file.text());
+                var signPriv = await crypto.subtle.importKey("jwk", data.signKeyPair.privateKey, { name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]);
+                var signPub = await crypto.subtle.importKey("jwk", data.signKeyPair.publicKey, { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]);
+                var encPriv = await crypto.subtle.importKey("jwk", data.encryptKeyPair.privateKey, { name: "ECDH", namedCurve: "P-256" }, true, ["deriveKey"]);
+                var encPub = await crypto.subtle.importKey("jwk", data.encryptKeyPair.publicKey, { name: "ECDH", namedCurve: "P-256" }, true, []);
+                state.keys = { sign: { privateKey: signPriv, publicKey: signPub }, encrypt: { privateKey: encPriv, publicKey: encPub } };
+                state.fingerprint = data.fingerprint;
+                state.currentUser = data.name;
+                connectToServer();
+            } catch (e) { alert('Failed to load keys'); }
+        }
+
+        function connectToServer() {
+            document.getElementById('login-overlay').style.display = 'none';
+            document.getElementById('main-header').style.display = 'flex';
+            document.getElementById('main-container').style.display = 'flex';
+            var protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(protocol + '//' + location.host + '/ws');
+            ws.onopen = function() {
+                updateStatus(true);
+                ws.send(JSON.stringify({ type: 'handshake', name: state.currentUser, id: state.fingerprint, fingerprint: state.fingerprint }));
+                addEvent('Connected');
+            };
+            ws.onmessage = function(e) { handleMessage(JSON.parse(e.data)); };
+            ws.onerror = function() { updateStatus(false); };
+            ws.onclose = function() { updateStatus(false); addEvent('Disconnected'); };
+        }
+
+        function panic() {
+            if (!confirm('PANIC MODE - Destroy all keys and disconnect?')) return;
+            state = { currentUser: '', fingerprint: '', users: [], keys: null };
+            if (ws) { ws.close(); ws = null; }
+            document.getElementById('main-header').style.display = 'none';
+            document.getElementById('main-container').style.display = 'none';
+            document.getElementById('login-overlay').style.display = 'flex';
+            document.getElementById('identity-display').style.display = 'none';
+            document.getElementById('username-input').value = '';
+            document.getElementById('generate-btn').disabled = false;
+            document.getElementById('messages-area').innerHTML = '';
+            console.clear();
+        }
+
+        function logout() {
+            if (!confirm('Logout?')) return;
+            if (ws) { ws.close(); ws = null; }
+            document.getElementById('main-header').style.display = 'none';
+            document.getElementById('main-container').style.display = 'none';
+            document.getElementById('login-overlay').style.display = 'flex';
+            switchLoginTab('load');
+        }
+
+        function updateStatus(connected) {
+            var dot = document.getElementById('status-dot');
+            var text = document.getElementById('status-text');
+            dot.className = connected ? 'status-dot' : 'status-dot disconnected';
+            text.textContent = connected ? 'Connected' : 'Disconnected';
+        }
+
+        function handleMessage(msg) {
+            switch(msg.type) {
+                case 'users_list': state.users = msg.users; renderUsers(); break;
+                case 'public': addChatMessage(msg.from_name, msg.text, msg.from_avatar); break;
+                case 'private': addChatMessage(msg.from_name + ' (PM)', msg.text, msg.from_avatar); break;
+                case 'system': addSystemMessage(msg.text); break;
+                case 'user_join': case 'user_leave': addEvent(msg.text); break;
+            }
+        }
+
+        function addEvent(text) {
+            var el = document.getElementById('events-list');
+            var time = new Date().toLocaleTimeString().slice(0,5);
+            el.innerHTML += '<div class="event-item">' + time + ' - ' + escapeHtml(text) + '</div>';
+            while (el.children.length > 10) el.removeChild(el.firstChild);
+            el.scrollTop = el.scrollHeight;
+        }
+
+        function renderUsers() {
+            var el = document.getElementById('users-list');
+            el.innerHTML = '';
+            state.users.forEach(function(u) {
+                el.innerHTML += '<div class="user-item" onclick="startPM(\'' + u.id + '\')"><div class="user-avatar">' + escapeHtml(u.avatar) + '</div><div>' + escapeHtml(u.name) + '</div></div>';
+            });
+            document.getElementById('user-count').textContent = '(' + state.users.length + ')';
+        }
+
+        function startPM(id) { document.getElementById('message-input').value = '/pm ' + id + ' '; document.getElementById('message-input').focus(); }
+
+        function sendMessage() {
+            var input = document.getElementById('message-input');
+            var text = input.value.trim();
+            if (!text || !ws) return;
+            var msg = { type: 'public', text: text };
+            if (text.startsWith('/pm ')) {
+                var parts = text.slice(4).split(' ');
+                msg = { type: 'private', to: parts[0], text: parts.slice(1).join(' ') };
+            }
+            ws.send(JSON.stringify(msg));
+            addChatMessage(state.currentUser, text, state.currentUser[0]);
+            input.value = '';
+        }
+
+        function addChatMessage(author, text, avatar) {
+            var el = document.getElementById('messages-area');
+            var time = new Date().toLocaleTimeString().slice(0,5);
+            el.innerHTML += '<div class="message"><div class="message-avatar">' + escapeHtml(avatar || '?') + '</div><div class="message-content"><div class="message-header"><span class="message-author">' + escapeHtml(author) + '</span><span class="message-time">' + time + '</span></div><div class="message-text">' + escapeHtml(text) + '</div></div></div>';
+            el.scrollTop = el.scrollHeight;
+        }
+
+        function addSystemMessage(text) {
+            var el = document.getElementById('messages-area');
+            el.innerHTML += '<div class="system-message">' + escapeHtml(text) + '</div>';
+            el.scrollTop = el.scrollHeight;
+        }
+
+        function escapeHtml(text) { var d = document.createElement('div'); d.textContent = text; return d.innerHTML; }
+
+        document.getElementById('message-input').addEventListener('keypress', function(e) { if (e.key === 'Enter') sendMessage(); });
+    </script>
+</body>
+</html>
