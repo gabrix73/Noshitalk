@@ -18,6 +18,141 @@ NoshiTalk is a self-hosted instant messaging platform designed for decentralized
 
 ---
 
+## Project Structure
+
+```
+noshitalk/
+├── cmd/                    # Application entry points
+│   ├── server/            # TCP server for Tor hidden service
+│   ├── cli-client/        # Command-line interface client
+│   ├── gui-client/        # Desktop GUI client (Fyne)
+│   └── web-client/        # Web interface with WebSocket
+├── pkg/                    # Shared libraries
+│   ├── crypto/            # Encryption, padding, ECDH, HMAC auth
+│   ├── protocol/          # Message types and JSON serialization
+│   ├── identity/          # Persistent identity management
+│   └── tor/               # Tor SOCKS5 proxy utilities
+├── Makefile               # Build automation
+├── go.mod                 # Go module definition
+└── README.md              # This file
+```
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Go 1.19+
+- Tor daemon (for client connections)
+
+### Build
+
+```bash
+# Clone repository
+git clone https://github.com/gabrix73/Noshitalk.git
+cd Noshitalk
+
+# Build all components
+make build-all
+
+# Or build individual components
+make server        # bin/noshitalk-server
+make cli-client    # bin/noshitalk-cli
+make gui-client    # bin/noshitalk-gui
+make web-client    # bin/noshitalk-web
+```
+
+### Run Tests
+
+```bash
+make test          # Run all tests
+make test-verbose  # Verbose output
+make coverage      # Generate HTML coverage report
+```
+
+### Available Make Targets
+
+```bash
+make help          # Show all available targets
+```
+
+| Target | Description |
+|--------|-------------|
+| `build-all` | Build all components |
+| `test` | Run tests with coverage |
+| `test-race` | Run tests with race detector |
+| `coverage` | Generate HTML coverage report |
+| `bench` | Run benchmarks |
+| `fmt` | Format code |
+| `vet` | Run go vet |
+| `clean` | Remove build artifacts |
+| `release` | Build for all platforms |
+
+---
+
+## Components
+
+### Server (`cmd/server`)
+
+TCP server designed for Tor hidden service deployment. Handles:
+- Client connections via encrypted channel
+- Message routing (public and private)
+- File transfers
+- Ghost mode (invisible users)
+- Key rotation
+
+```bash
+./bin/noshitalk-server
+# Listens on 127.0.0.1:8083
+```
+
+### CLI Client (`cmd/cli-client`)
+
+Lightweight terminal-based client:
+
+```bash
+./bin/noshitalk-cli
+# Enter .onion address when prompted
+```
+
+Commands:
+- `/help` - Show commands
+- `/users` - List online users
+- `/pm user message` - Private message
+- `/ghost` / `/reveal` - Toggle visibility
+- `/quit` - Exit
+
+### GUI Client (`cmd/gui-client`)
+
+Desktop application using Fyne framework:
+
+```bash
+./bin/noshitalk-gui
+```
+
+Features:
+- Visual user list
+- Click-to-PM
+- Auto-reconnect
+- PANIC button (wipe keys)
+
+### Web Client (`cmd/web-client`)
+
+Browser-based interface:
+
+```bash
+./bin/noshitalk-web
+# Access at http://localhost:8080
+```
+
+Features:
+- WebSocket communication
+- Browser-based key generation
+- Export/import .noshikey files
+
+---
+
 ## VPS Installation (Debian/Ubuntu)
 
 ### Requirements
@@ -36,44 +171,18 @@ sudo apt update && sudo apt upgrade -y
 sudo apt install -y tor golang-go git build-essential
 ```
 
-Verify:
-```bash
-tor --version  # Expected: 0.4.x+
-go version     # Expected: 1.19+
-```
-
-#### 2. Clone repository
+#### 2. Clone and build
 
 ```bash
 cd ~
 git clone https://github.com/gabrix73/Noshitalk.git
 cd Noshitalk
+make server web-client
 ```
 
-#### 3. Build with hardened flags
+#### 3. Configure Tor
 
-```bash
-go build \
-  -ldflags="-s -w" \
-  -trimpath \
-  -buildmode=pie \
-  -o noshitalk-server \
-  noshitalk-web-client.go
-```
-
-**Build flags:**
-- `-ldflags="-s -w"`: Strip symbols and DWARF tables
-- `-trimpath`: Remove filesystem paths
-- `-buildmode=pie`: Position-independent executable (ASLR)
-
-#### 4. Configure Tor
-
-Edit configuration:
-```bash
-sudo nano /etc/tor/torrc
-```
-
-Add:
+Edit `/etc/tor/torrc`:
 ```
 HiddenServiceDir /var/lib/tor/noshitalk/
 HiddenServicePort 8080 127.0.0.1:8080
@@ -82,21 +191,15 @@ HiddenServicePort 8080 127.0.0.1:8080
 Restart Tor:
 ```bash
 sudo systemctl restart tor
-sudo systemctl enable tor
+sudo cat /var/lib/tor/noshitalk/hostname  # Get .onion address
 ```
 
-Retrieve .onion address:
-```bash
-sudo cat /var/lib/tor/noshitalk/hostname
-```
-
-#### 5. Create systemd service
+#### 4. Create systemd service
 
 ```bash
 sudo nano /etc/systemd/system/noshitalk.service
 ```
 
-Configuration:
 ```ini
 [Unit]
 Description=NoshiTalk Server
@@ -107,21 +210,17 @@ Requires=tor.service
 Type=simple
 User=YOUR_USERNAME
 WorkingDirectory=/home/YOUR_USERNAME/Noshitalk
-ExecStart=/home/YOUR_USERNAME/Noshitalk/noshitalk-server
+ExecStart=/home/YOUR_USERNAME/Noshitalk/bin/noshitalk-web
 Restart=always
 RestartSec=10
 
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/home/YOUR_USERNAME/Noshitalk
 
 [Install]
 WantedBy=multi-user.target
 ```
-
-Replace `YOUR_USERNAME` with actual username.
 
 Enable and start:
 ```bash
@@ -130,53 +229,51 @@ sudo systemctl enable noshitalk
 sudo systemctl start noshitalk
 ```
 
-Check status:
-```bash
-sudo systemctl status noshitalk
-```
-
-#### 6. Configure firewall
-
-```bash
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
-sudo ufw allow ssh
-sudo ufw enable
-```
-
-Note: No incoming ports required (Tor handles routing).
-
-#### 7. Verify
-
-Access via Tor Browser:
-```
-http://YOUR_ONION_ADDRESS.onion
-```
-
 ---
 
 ## Architecture
 
-### Decentralization
+### Shared Packages
 
-Each server operates independently. No federation protocol implemented (servers do not communicate). Users connect directly to specific .onion addresses.
+#### `pkg/crypto`
+- `PadMessage()` / `UnpadMessage()` - Traffic analysis resistance
+- `EncryptMessage()` / `DecryptMessage()` - AES-256-GCM
+- `PerformClientAuth()` / `PerformServerAuth()` - HMAC mutual auth
+- `GenerateX25519KeyPair()` / `PerformECDH()` - Key exchange
+- `RandomDelay()` - Timing attack mitigation
 
-**Network characteristics:**
-- No single point of failure
-- Geographic/jurisdictional distribution
-- Each instance sets own policies
+#### `pkg/protocol`
+- `Message` - Chat message structure
+- `UserListMessage` - Online users
+- `FileOfferMessage` / `FileChunkMessage` - File transfers
+- `KeyRotationMessage` - Forward secrecy
 
-### Cryptographic Implementation
+#### `pkg/identity`
+- `New()` - Generate new identity
+- `Load()` / `Save()` - Persistent storage
+- `LoadOrCreate()` - Auto-initialize
 
-**Identity:** Ed25519 public key hash serves as user identifier
+#### `pkg/tor`
+- `ValidateOnionAddress()` - v3 .onion validation
+- `Connect()` - SOCKS5 proxy connection
+- `Dialer` - Reusable connection helper
 
-**Key Exchange:** ECDH X25519 generates shared secret
+### Cryptographic Flow
 
-**Encryption:** AES-256-GCM with derived keys
-
-**Authentication:** Challenge-response using Ed25519 signatures
-
-**Transport:** Tor v3 hidden services
+```
+Client                              Server
+  |                                   |
+  |------ Connect via Tor:9050 ----->|
+  |------ Public Key (32B) --------->|
+  |<----- Public Key (32B) ----------|
+  |       [ECDH Shared Secret]       |
+  |<----- Challenge (32B) -----------|
+  |------ HMAC Response (32B) ------>|
+  |------ Challenge (32B) ---------->|
+  |<----- HMAC Response (32B) -------|
+  |       [AES-256-GCM Session]      |
+  |<===== Encrypted Messages =======>|
+```
 
 ### Zero-Knowledge Design
 
@@ -184,95 +281,7 @@ Server cannot:
 - Decrypt message content (E2E encrypted)
 - Log IP addresses (Tor anonymization)
 - Access private keys (client-side generation)
-- Store messages (RAM only, no database)
-
-### Client Implementation
-
-**Web:** JavaScript WebCrypto API, keys in browser memory
-
-**Desktop:** Go native with memguard (encrypted RAM)
-
-**CLI:** Go terminal interface
-
-All clients generate keys locally and support .noshikey file export.
-
----
-
-## Configuration
-
-### Performance Tuning
-
-For high-traffic servers, increase file descriptor limits:
-
-```bash
-sudo nano /etc/security/limits.conf
-```
-
-Add:
-```
-YOUR_USERNAME soft nofile 65535
-YOUR_USERNAME hard nofile 65535
-```
-
-### Monitoring
-
-View logs:
-```bash
-sudo journalctl -u noshitalk -f
-```
-
-Check Tor:
-```bash
-sudo systemctl status tor
-```
-
-### Updates
-
-```bash
-cd ~/Noshitalk
-git pull
-go build -ldflags="-s -w" -trimpath -buildmode=pie -o noshitalk-server noshitalk-web-client.go
-sudo systemctl restart noshitalk
-```
-
----
-
-## Troubleshooting
-
-### Server fails to start
-
-Check logs:
-```bash
-sudo journalctl -u noshitalk -n 50
-```
-
-Common causes:
-- Tor not running: `sudo systemctl start tor`
-- Port conflict: Change port or kill conflicting process
-- Permission errors: Verify systemd service user
-
-### Tor connection issues
-
-Verify Tor status:
-```bash
-sudo systemctl status tor
-```
-
-Check Tor logs:
-```bash
-sudo journalctl -u tor -f
-```
-
-Verify hidden service:
-```bash
-sudo ls -la /var/lib/tor/noshitalk/
-```
-
-### Client connection failures
-
-1. Verify .onion address: `sudo cat /var/lib/tor/noshitalk/hostname`
-2. Check server listening: `sudo netstat -tlnp | grep 8080`
-3. Test locally: `curl -x socks5h://localhost:9050 http://YOUR_ONION.onion`
+- Store messages (RAM only)
 
 ---
 
@@ -285,10 +294,7 @@ sudo ls -la /var/lib/tor/noshitalk/
 | Encryption | AES-GCM | 256-bit |
 | Authentication | HMAC-SHA256 | 256-bit |
 | Transport | Tor v3 | - |
-
-**Language:** Go
-
-**License:** MIT
+| Padding | 256-byte blocks | - |
 
 ---
 
@@ -299,31 +305,48 @@ sudo ls -la /var/lib/tor/noshitalk/
 **Protected against:**
 - Network surveillance (Tor)
 - Server compromise (E2E encryption)
-- Metadata harvesting (zero-knowledge design)
+- Metadata harvesting (zero-knowledge)
+- Traffic analysis (message padding)
+- Timing attacks (random delays)
 
 **Not protected against:**
 - Client device compromise
 - Physical device seizure
 - Social engineering
-- Global passive adversary
 
 ### Memory Protection
 
-**Desktop client:** memguard encrypts key material in RAM
+- **Desktop/CLI:** memguard encrypts keys in RAM
+- **Web:** Keys cleared on disconnect/panic
+- **All:** Random padding prevents size analysis
 
-**Web client:** Keys cleared on disconnect/panic
+---
 
-### Build Security
+## Development
 
-Recommended compilation:
+### Running Tests
+
 ```bash
-go build -ldflags="-s -w" -trimpath -buildmode=pie
+make test          # Quick test
+make test-verbose  # Detailed output
+make test-race     # Race condition detection
+make coverage      # HTML report in coverage/
+make bench         # Performance benchmarks
 ```
 
-This enables:
-- ASLR (Address Space Layout Randomization)
-- Symbol stripping (reduced attack surface)
-- Path obfuscation (information disclosure prevention)
+### Code Quality
+
+```bash
+make fmt           # Format code
+make vet           # Static analysis
+make lint          # golangci-lint (if installed)
+```
+
+### Building Releases
+
+```bash
+make release       # Builds for Linux, macOS, Windows (amd64/arm64)
+```
 
 ---
 
@@ -331,17 +354,9 @@ This enables:
 
 1. Fork repository
 2. Create feature branch
-3. Commit changes
-4. Open pull request
-
-### Development
-
-```bash
-git clone https://github.com/gabrix73/Noshitalk.git
-cd Noshitalk
-go mod download
-go test ./...
-```
+3. Run `make test` and `make fmt`
+4. Commit changes
+5. Open pull request
 
 ### Security Issues
 
