@@ -339,45 +339,22 @@ func TestSecureBuffer(t *testing.T) {
 	// We can't easily test this without accessing memguard internals
 }
 
-// Mock connection for auth tests
-type mockConn struct {
-	readBuf  *bytes.Buffer
-	writeBuf *bytes.Buffer
-}
-
-func newMockConnPair() (*mockConn, *mockConn) {
-	buf1 := &bytes.Buffer{}
-	buf2 := &bytes.Buffer{}
-	return &mockConn{readBuf: buf1, writeBuf: buf2},
-		&mockConn{readBuf: buf2, writeBuf: buf1}
-}
-
-func (m *mockConn) Read(b []byte) (n int, err error)   { return m.readBuf.Read(b) }
-func (m *mockConn) Write(b []byte) (n int, err error)  { return m.writeBuf.Write(b) }
-func (m *mockConn) Close() error                       { return nil }
-func (m *mockConn) LocalAddr() net.Addr                { return nil }
-func (m *mockConn) RemoteAddr() net.Addr               { return nil }
-func (m *mockConn) SetDeadline(t time.Time) error      { return nil }
-func (m *mockConn) SetReadDeadline(t time.Time) error  { return nil }
-func (m *mockConn) SetWriteDeadline(t time.Time) error { return nil }
-
 func TestMutualAuth(t *testing.T) {
 	sharedSecret := make([]byte, 32)
 	for i := range sharedSecret {
 		sharedSecret[i] = byte(i)
 	}
 
-	// Create connected mock pair
-	serverConn, clientConn := newMockConnPair()
+	// Create a proper bidirectional connection using net.Pipe
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
 
 	// Run server auth in goroutine
 	serverErr := make(chan error, 1)
 	go func() {
 		serverErr <- PerformServerAuth(serverConn, sharedSecret)
 	}()
-
-	// Small delay to ensure server sends challenge first
-	time.Sleep(10 * time.Millisecond)
 
 	// Run client auth
 	err := PerformClientAuth(clientConn, sharedSecret)

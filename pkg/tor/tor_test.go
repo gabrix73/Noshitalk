@@ -11,20 +11,20 @@ func TestValidateOnionAddress(t *testing.T) {
 		addr    string
 		wantErr bool
 	}{
-		// Valid v3 .onion addresses
+		// Valid v3 .onion addresses (56 base32 chars + .onion)
 		{
 			name:    "valid v3 onion with port",
-			addr:    "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv.onion:8080",
+			addr:    "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion:8080",
 			wantErr: false,
 		},
 		{
 			name:    "valid v3 onion without port",
-			addr:    "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv.onion",
+			addr:    "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion",
 			wantErr: false,
 		},
 		{
 			name:    "valid v3 onion lowercase",
-			addr:    "vwxyz234567abcdefghijklmnopqrstuvwxyz234567abcdefghijk.onion:443",
+			addr:    "vwxyz234567abcdefghijklmnopqrstuvwxyz234567abcdefghijklm.onion:443",
 			wantErr: false,
 		},
 
@@ -51,27 +51,27 @@ func TestValidateOnionAddress(t *testing.T) {
 		},
 		{
 			name:    "uppercase not allowed",
-			addr:    "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUV.onion",
+			addr:    "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVWX.onion",
 			wantErr: true,
 		},
 		{
 			name:    "invalid characters",
-			addr:    "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst01.onion",
-			wantErr: true, // 0 and 1 not in base32
+			addr:    "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst0189.onion",
+			wantErr: true, // 0, 1, 8, 9 not in base32
 		},
 		{
 			name:    "too long",
-			addr:    "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxyz.onion",
+			addr:    "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxyzab.onion",
 			wantErr: true,
 		},
 		{
 			name:    "missing .onion",
-			addr:    "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv",
+			addr:    "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx",
 			wantErr: true,
 		},
 		{
 			name:    "invalid port",
-			addr:    "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv.onion:999999",
+			addr:    "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion:999999",
 			wantErr: true,
 		},
 		{
@@ -114,12 +114,12 @@ func TestValidateOnionAddress_ErrorMessages(t *testing.T) {
 }
 
 func TestOnionRegex(t *testing.T) {
-	// Valid patterns
+	// Valid patterns (56 base32 chars + .onion + optional port)
 	validAddrs := []string{
-		"abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv.onion",
-		"abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv.onion:80",
-		"abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv.onion:8080",
-		"abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv.onion:65535",
+		"abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion",
+		"abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion:80",
+		"abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion:8080",
+		"abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion:65535",
 	}
 
 	for _, addr := range validAddrs {
@@ -261,7 +261,7 @@ func TestConstants(t *testing.T) {
 
 // Benchmark validation
 func BenchmarkValidateOnionAddress_Valid(b *testing.B) {
-	addr := "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv.onion:8080"
+	addr := "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion:8080"
 	for i := 0; i < b.N; i++ {
 		ValidateOnionAddress(addr)
 	}
@@ -275,7 +275,7 @@ func BenchmarkValidateOnionAddress_Invalid(b *testing.B) {
 }
 
 func BenchmarkOnionRegex_Match(b *testing.B) {
-	addr := "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv.onion:8080"
+	addr := "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion:8080"
 	for i := 0; i < b.N; i++ {
 		OnionRegex.MatchString(addr)
 	}
