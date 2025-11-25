@@ -1,364 +1,170 @@
-# NoshiTalk
+# NoshiTalk v2.0.0 - Zero-Knowledge Encrypted Chat
 
-Self-hosted encrypted chat over Tor with Ed25519 cryptographic identity.
+Sistema di chat sicuro con crittografia end-to-end e architettura zero-knowledge.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Go 1.19+](https://img.shields.io/badge/Go-1.19+-00ADD8)](https://go.dev/)
+## Caratteristiche
 
-## Overview
+- **End-to-End Encryption**: X25519 ECDH + AES-GCM-256
+- **Perfect Forward Secrecy**: Chiavi effimere per ogni sessione
+- **Zero-Knowledge Server**: Il server è un relay cieco - non può leggere i messaggi
+- **Memory Protection**: memguard per protezione della memoria
+- **Zero Logging**: Nessun dato viene salvato su disco
+- **Tor Ready**: Configurabile come hidden service
 
-NoshiTalk is a self-hosted instant messaging platform designed for decentralized operation over Tor. Each instance operates independently with no central authority.
+## Architettura
 
-**Key characteristics:**
-- Ed25519 cryptographic identity (no registration)
-- E2E encryption (ECDH X25519 + AES-256-GCM)
-- Ephemeral messages (RAM only, no persistence)
-- Tor-only routing (.onion hidden services)
-- Zero-knowledge server architecture
-
----
-
-## VPS Installation (Debian/Ubuntu)
-
-### Requirements
-
-- Debian 11+ or Ubuntu 20.04+
-- 512MB RAM minimum (1GB recommended)
-- Tor daemon
-- Go 1.19+
-
-### Setup
-
-#### 1. Install dependencies
-
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y tor golang-go git build-essential
+```
+Browser (Web Crypto API)
+    ↓ SSE (Server-Sent Events) + HTTP POST
+Go Server (blind relay)
+    ↓ SSE + POST
+Browser (Web Crypto API)
 ```
 
-Verify:
-```bash
-tor --version  # Expected: 0.4.x+
-go version     # Expected: 1.19+
-```
+La crittografia avviene interamente nel browser:
+1. Il browser genera keypair X25519 effimero
+2. Scambia chiavi pubbliche con altri utenti via server
+3. Deriva shared secret con ECDH
+4. Cripta/decripta messaggi con AES-GCM-256
 
-#### 2. Clone repository
+Il server vede solo blob crittografati.
 
-```bash
-cd ~
-git clone https://github.com/gabrix73/Noshitalk.git
-cd Noshitalk
-```
-
-#### 3. Build with hardened flags
+## Build
 
 ```bash
-go build \
-  -ldflags="-s -w" \
-  -trimpath \
-  -buildmode=pie \
-  -o noshitalk-server \
-  noshitalk-web-client.go
+# Richiede Go 1.21+
+go mod tidy
+CGO_ENABLED=0 go build -ldflags="-s -w" -o noshitalk main.go
 ```
 
-**Build flags:**
-- `-ldflags="-s -w"`: Strip symbols and DWARF tables
-- `-trimpath`: Remove filesystem paths
-- `-buildmode=pie`: Position-independent executable (ASLR)
+## Esecuzione
 
-#### 4. Configure Tor
-
-Edit configuration:
 ```bash
-sudo nano /etc/tor/torrc
+# Default porta 8080
+./noshitalk
+
+# Porta custom
+NOSHITALK_PORT=3000 ./noshitalk
 ```
 
-Add:
+## Deployment con Tor Hidden Service
+
+1. Installa Tor:
+```bash
+apt install tor
+```
+
+2. Configura `/etc/tor/torrc`:
 ```
 HiddenServiceDir /var/lib/tor/noshitalk/
-HiddenServicePort 8080 127.0.0.1:8080
+HiddenServicePort 80 127.0.0.1:8080
 ```
 
-Restart Tor:
+3. Riavvia Tor:
 ```bash
-sudo systemctl restart tor
-sudo systemctl enable tor
+systemctl restart tor
 ```
 
-Retrieve .onion address:
+4. Ottieni indirizzo .onion:
 ```bash
-sudo cat /var/lib/tor/noshitalk/hostname
+cat /var/lib/tor/noshitalk/hostname
 ```
 
-#### 5. Create systemd service
+## Deployment con Apache (opzionale)
 
-```bash
-sudo nano /etc/systemd/system/noshitalk.service
+```apache
+<VirtualHost *:443>
+    ServerName chat.example.com
+    
+    SSLEngine on
+    SSLCertificateFile /path/to/cert.pem
+    SSLCertificateKeyFile /path/to/key.pem
+    
+    ProxyPreserveHost On
+    ProxyPass / http://127.0.0.1:8080/
+    ProxyPassReverse / http://127.0.0.1:8080/
+    
+    # SSE requires no buffering
+    SetEnv proxy-sendchunked 1
+    SetEnv proxy-nokeepalive 1
+</VirtualHost>
 ```
 
-Configuration:
+## Systemd Service
+
+Crea `/etc/systemd/system/noshitalk.service`:
+
 ```ini
 [Unit]
-Description=NoshiTalk Server
-After=network.target tor.service
-Requires=tor.service
+Description=NoshiTalk Secure Chat
+After=network.target
 
 [Service]
 Type=simple
-User=YOUR_USERNAME
-WorkingDirectory=/home/YOUR_USERNAME/Noshitalk
-ExecStart=/home/YOUR_USERNAME/Noshitalk/noshitalk-server
-Restart=always
-RestartSec=10
+User=noshitalk
+ExecStart=/opt/noshitalk/noshitalk
+Restart=on-failure
+RestartSec=5
+Environment=NOSHITALK_PORT=8080
 
-NoNewPrivileges=true
-PrivateTmp=true
+# Security hardening
+NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/home/YOUR_USERNAME/Noshitalk
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Replace `YOUR_USERNAME` with actual username.
-
-Enable and start:
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable noshitalk
-sudo systemctl start noshitalk
+systemctl daemon-reload
+systemctl enable noshitalk
+systemctl start noshitalk
 ```
 
-Check status:
-```bash
-sudo systemctl status noshitalk
+## API Endpoints
+
+| Endpoint | Method | Descrizione |
+|----------|--------|-------------|
+| `/` | GET | Interfaccia web |
+| `/join` | POST | Entra in chat |
+| `/leave` | POST | Esci dalla chat |
+| `/events` | GET | SSE stream messaggi |
+| `/send` | POST | Invia messaggio |
+| `/key-exchange` | GET/POST | Scambio chiavi pubbliche |
+| `/health` | GET | Health check |
+
+## Sicurezza
+
+- **Browser**: Web Crypto API per X25519/AES-GCM (nativo, no librerie esterne)
+- **Server**: memguard per protezione memoria, cleanup sicuro
+- **Rete**: Supporto TLS, Tor hidden service
+- **Policy**: Zero logging, auto-purge alla disconnessione
+
+## File
+
+```
+noshitalk-web/
+├── main.go              # Server Go con SSE
+├── static/
+│   └── index.html       # Frontend con Web Crypto API
+├── go.mod
+├── go.sum
+└── README.md
 ```
 
-#### 6. Configure firewall
+## Note
 
-```bash
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
-sudo ufw allow ssh
-sudo ufw enable
-```
+- Il browser DEVE supportare Web Crypto API con X25519 (Chrome 113+, Firefox 72+)
+- Per browser più vecchi, considera fallback a curve25519-js (non incluso)
+- La chat pubblica attualmente usa encryption semplificata per demo
+- Per produzione seria, implementa proper group encryption (Signal Protocol)
 
-Note: No incoming ports required (Tor handles routing).
+## Licenza
 
-#### 7. Verify
-
-Access via Tor Browser:
-```
-http://YOUR_ONION_ADDRESS.onion
-```
-
----
-
-## Architecture
-
-### Decentralization
-
-Each server operates independently. No federation protocol implemented (servers do not communicate). Users connect directly to specific .onion addresses.
-
-**Network characteristics:**
-- No single point of failure
-- Geographic/jurisdictional distribution
-- Each instance sets own policies
-
-### Cryptographic Implementation
-
-**Identity:** Ed25519 public key hash serves as user identifier
-
-**Key Exchange:** ECDH X25519 generates shared secret
-
-**Encryption:** AES-256-GCM with derived keys
-
-**Authentication:** Challenge-response using Ed25519 signatures
-
-**Transport:** Tor v3 hidden services
-
-### Zero-Knowledge Design
-
-Server cannot:
-- Decrypt message content (E2E encrypted)
-- Log IP addresses (Tor anonymization)
-- Access private keys (client-side generation)
-- Store messages (RAM only, no database)
-
-### Client Implementation
-
-**Web:** JavaScript WebCrypto API, keys in browser memory
-
-**Desktop:** Go native with memguard (encrypted RAM)
-
-**CLI:** Go terminal interface
-
-All clients generate keys locally and support .noshikey file export.
-
----
-
-## Configuration
-
-### Performance Tuning
-
-For high-traffic servers, increase file descriptor limits:
-
-```bash
-sudo nano /etc/security/limits.conf
-```
-
-Add:
-```
-YOUR_USERNAME soft nofile 65535
-YOUR_USERNAME hard nofile 65535
-```
-
-### Monitoring
-
-View logs:
-```bash
-sudo journalctl -u noshitalk -f
-```
-
-Check Tor:
-```bash
-sudo systemctl status tor
-```
-
-### Updates
-
-```bash
-cd ~/Noshitalk
-git pull
-go build -ldflags="-s -w" -trimpath -buildmode=pie -o noshitalk-server noshitalk-web-client.go
-sudo systemctl restart noshitalk
-```
-
----
-
-## Troubleshooting
-
-### Server fails to start
-
-Check logs:
-```bash
-sudo journalctl -u noshitalk -n 50
-```
-
-Common causes:
-- Tor not running: `sudo systemctl start tor`
-- Port conflict: Change port or kill conflicting process
-- Permission errors: Verify systemd service user
-
-### Tor connection issues
-
-Verify Tor status:
-```bash
-sudo systemctl status tor
-```
-
-Check Tor logs:
-```bash
-sudo journalctl -u tor -f
-```
-
-Verify hidden service:
-```bash
-sudo ls -la /var/lib/tor/noshitalk/
-```
-
-### Client connection failures
-
-1. Verify .onion address: `sudo cat /var/lib/tor/noshitalk/hostname`
-2. Check server listening: `sudo netstat -tlnp | grep 8080`
-3. Test locally: `curl -x socks5h://localhost:9050 http://YOUR_ONION.onion`
-
----
-
-## Technical Specifications
-
-| Component | Algorithm | Key Size |
-|-----------|-----------|----------|
-| Identity | Ed25519 | 256-bit |
-| Key Exchange | ECDH X25519 | 256-bit |
-| Encryption | AES-GCM | 256-bit |
-| Authentication | HMAC-SHA256 | 256-bit |
-| Transport | Tor v3 | - |
-
-**Language:** Go
-
-**License:** MIT
-
----
-
-## Security
-
-### Threat Model
-
-**Protected against:**
-- Network surveillance (Tor)
-- Server compromise (E2E encryption)
-- Metadata harvesting (zero-knowledge design)
-
-**Not protected against:**
-- Client device compromise
-- Physical device seizure
-- Social engineering
-- Global passive adversary
-
-### Memory Protection
-
-**Desktop client:** memguard encrypts key material in RAM
-
-**Web client:** Keys cleared on disconnect/panic
-
-### Build Security
-
-Recommended compilation:
-```bash
-go build -ldflags="-s -w" -trimpath -buildmode=pie
-```
-
-This enables:
-- ASLR (Address Space Layout Randomization)
-- Symbol stripping (reduced attack surface)
-- Path obfuscation (information disclosure prevention)
-
----
-
-## Contributing
-
-1. Fork repository
-2. Create feature branch
-3. Commit changes
-4. Open pull request
-
-### Development
-
-```bash
-git clone https://github.com/gabrix73/Noshitalk.git
-cd Noshitalk
-go mod download
-go test ./...
-```
-
-### Security Issues
-
-Report to: security@virebent.art
-
-Do not open public issues for vulnerabilities.
-
----
-
-## License
-
-MIT License. See [LICENSE](LICENSE) file.
-
----
-
-## Links
-
-- Documentation: [virebent.art/noshitalk.html](https://virebent.art/noshitalk.html)
-- Repository: [github.com/gabrix73/Noshitalk](https://github.com/gabrix73/Noshitalk)
-- Issues: [github.com/gabrix73/Noshitalk/issues](https://github.com/gabrix73/Noshitalk/issues)
+MIT
